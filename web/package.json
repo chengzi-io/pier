@@ -1,0 +1,25 @@
+{
+	"name": "@pier/web",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "vite",
+		"build": "vite build",
+		"preview": "vite preview",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"test": "vitest run"
+	},
+	"dependencies": {
+		"lucide-preact": "^0.544.0",
+		"preact": "^10.26.9",
+		"preact-iso": "^2.12.0",
+		"zod": "^3.24.2"
+	},
+	"devDependencies": {
+		"@preact/preset-vite": "^2.10.2",
+		"@types/node": "^22.14.0",
+		"typescript": "^5.8.2",
+		"vite": "^7.0.4",
+		"vitest": "^3.1.1"
+	}
+}
