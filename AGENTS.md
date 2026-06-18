@@ -30,10 +30,13 @@ A MCP server that reads Pi Agent definitions and exposes them as trackable agent
 
 - @modelcontextprotocol/sdk 
 
-### Agent Framework - [Pi](https://github.com/earendil-works/pi)
+### Pi
 
-- @earendil-works/pi-coding-agent
-- @earendil-works/pi-ai
+Use [Pi Agent](https://github.com/earendil-works/pi) [RPC mode](https://pi.dev/docs/latest/rpc)
+
+prerequisites:
+- `pnpm add -g --ignore-scripts @earendil-works/pi-coding-agent`(Priority)
+-  or `npm i -g @earendil-works/pi-coding-agent`
 
 ### Git Hooks
 
@@ -49,6 +52,7 @@ A MCP server that reads Pi Agent definitions and exposes them as trackable agent
 - Follow conventional commits
 - Never push without user acpect
 - Do not add  `Co-Authored-By`  to the commit message.
+- worktrees store at `${PROJECT_ROOT}/.worktrees`
 
 ## ADRS
 
@@ -58,7 +62,7 @@ A MCP server that reads Pi Agent definitions and exposes them as trackable agent
 
 Before you start developing the front-end, you MUST read and follow the [Design Specification](DESIGN.md)
 
-## Store At Tmp Dir
+## Store At Tmp Dir（）
 
 - All tmp files store at `${PROJECT_ROOT}/.tmp`.
-- Only when something becomes a project fact (implementation, adoption, etc.) can it be moved to the project (managed by git).
+- NEVER commit

@@ -10,8 +10,6 @@
 		"test": "vitest run"
 	},
 	"dependencies": {
-		"@earendil-works/pi-ai": "^0.79.4",
-		"@earendil-works/pi-coding-agent": "^0.79.4",
 		"@hono/node-server": "^1.14.1",
 		"@modelcontextprotocol/sdk": "^1.12.1",
 		"hono": "^4.7.7",
