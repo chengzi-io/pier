@@ -13,10 +13,12 @@
 		"format": "biome format --write .",
 		"typecheck": "pnpm -r run typecheck",
 		"test": "pnpm -r run test",
+		"test:mcp:smoke": "node scripts/mcp-inspector-smoke.mjs",
 		"prepare": "simple-git-hooks"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^1.9.4",
+		"@modelcontextprotocol/inspector": "^0.22.0",
 		"lint-staged": "^15.4.3",
 		"simple-git-hooks": "^2.11.1",
 		"typescript": "^5.8.2"
