@@ -44,6 +44,13 @@
 - 同名时高优先级覆盖低优先级，即 项目 > 用户 > 内置
 - 内置 agent 路径默认**不扫描**，需 pier 启动时加 `--discover-pi-subagent-agents` 开启
 
+运行时发现语义：
+
+- Pier 启动时只加载全局 agent，作为稳定基础集合
+- 项目 agent 不按 “Pier 服务自身所在仓库” 加载
+- 当 MCP/REST 调用提供 `cwd` 时，Pier 才会根据这个 `cwd` 向上定位所属项目根，再读取该项目根下的 `.pi/agents/`
+- 因此项目 agent 的作用域始终属于“当前被操作的项目”，不是 Pier 项目本身
+
 ### 2.3 内置 agent 路径说明
 
 `~/.pi/agent/extensions/subagent/agents/` 是 `pi-subagents`（nicobailon/pi-subagents）包安装后的内置 agent 目录。当用户执行 `pi install npm:pi-subagents` 后，该目录存在于 `~/.pi/agent/extensions/subagent/agents/`。这些内置 agent 可在 pier 中复用，无需重复创建同名 `.md` 文件。
@@ -287,7 +294,8 @@ Rules:
 | 设置 | 值 | 说明 |
 |------|----|------|
 | `PI_OFFLINE` | `1` | 禁止 Pi 启动时连接 pi.dev |
-| `--approve` | 强制 | 信任 cwd 下 `.pi/` 的项目配置 |
+| 子进程 `cwd` | 强制 | 通过 Node `spawn(..., { cwd })` 设置 Pi 工作目录，而不是传递 Pi CLI flag |
+| `--approve` | 强制 | 信任运行目录 cwd 下 `.pi/` 的项目配置 |
 | `--name <agent-name>` | 强制 | sets session display name from agent name |
 | `--no-prompt-templates` | 强制 | Pier 不管理 prompt template |
 | `--mode rpc` | 强制 | 仅使用 RPC 模式 |
