@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Deterministic Pi CLI mock for pier tests. Never calls a model.
+
+Shaped after real Pi 1.5.0 behaviour that pier depends on:
+- unknown options -> "Error: Unknown option: X", exit 1
+- `--mode json` session event: {"type":"session","version":3,"id","timestamp","cwd"} (no file path)
+- `--session REF` that matches nothing -> "No session found matching", exit 1
+- piped stdin is prepended to the prompt (pier must pass /dev/null)
+- `@path` positional includes the file text in the prompt
+
+Env: MOCK_PI_RECORD (file, last argv), MOCK_PI_RECORD_DIR (one file per call),
+MOCK_PI_FAIL=1, MOCK_PI_FAIL_ON=<substring of prompt>, MOCK_PI_SLEEP=<s>,
+MOCK_PI_SLEEP_ON=<substring>, MOCK_PI_REPLY=<text>.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
+
+VALUE_FLAGS = {"--provider", "--model", "--thinking", "--tools", "-t", "--exclude-tools", "-xt",
+               "--name", "-n", "--session", "--session-id", "--session-dir", "--mode",
+               "--system-prompt", "--append-system-prompt", "--api-key", "-e", "--extension",
+               "--skill", "--models", "--export", "--fork"}
+# Flags that may appear more than once; stored as lists in opts.
+MULTI_VALUE_FLAGS = {"--skill", "--extension", "-e", "--append-system-prompt"}
+BOOL_FLAGS = {"--print", "-p", "--no-session", "--no-tools", "--no-builtin-tools", "--continue",
+              "-c", "--resume", "-r", "--offline", "--no-extensions", "--no-skills", "--no-mcp",
+              "--no-context-files", "-nc", "--approve", "--no-approve", "--verbose"}
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    rec = os.environ.get("MOCK_PI_RECORD")
+    if rec:
+        Path(rec).write_text(json.dumps(argv, ensure_ascii=False), encoding="utf-8")
+    rec_dir = os.environ.get("MOCK_PI_RECORD_DIR")
+    if rec_dir:
+        Path(rec_dir).mkdir(parents=True, exist_ok=True)
+        (Path(rec_dir) / f"{time.time_ns()}-{os.getpid()}.json").write_text(
+            json.dumps(argv, ensure_ascii=False), encoding="utf-8")
+    if "--help" in argv:
+        print("mock_pi")
+        return 0
+
+    opts: dict = {}
+    positionals: list = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            positionals += argv[i + 1:]
+            break
+        if a in VALUE_FLAGS:
+            if i + 1 >= len(argv):
+                print(f"Error: {a} requires a value", file=sys.stderr)
+                return 1
+            val = argv[i + 1]
+            if a in MULTI_VALUE_FLAGS:
+                # normalize -e into --extension
+                key = "--extension" if a in ("-e", "--extension") else a
+                opts.setdefault(key, []).append(val)
+            else:
+                opts[a] = val
+            i += 2
+            continue
+        if a in BOOL_FLAGS:
+            opts[a] = True
+            i += 1
+            continue
+        if a.startswith("-"):
+            print(f"Error: Unknown option: {a}", file=sys.stderr)
+            return 1
+        positionals.append(a)
+        i += 1
+
+    if "--provider" in opts and "--model" not in opts:
+        print("Error: --provider requires --model", file=sys.stderr)
+        return 1
+
+    parts = []
+    if not sys.stdin.isatty():
+        piped = sys.stdin.read()
+        if piped:
+            parts.append(piped)
+    for p in positionals:
+        if p.startswith("@"):
+            parts.append(Path(p[1:]).read_text(encoding="utf-8"))
+        else:
+            parts.append(p)
+    prompt = "\n".join(parts)
+
+    sdir = Path(opts.get("--session-dir") or (Path.cwd() / ".mock-sessions"))
+    sid = None
+    if not opts.get("--no-session"):
+        ref = opts.get("--session")
+        if ref:
+            cand = Path(ref)
+            if cand.is_file():
+                sid = cand.stem.split("_")[-1]
+            else:
+                hits = list(sdir.rglob(f"*{ref}*.jsonl")) if sdir.is_dir() else []
+                if not hits:
+                    print(f"No session found matching '{ref}'", file=sys.stderr)
+                    return 1
+                sid = hits[0].stem.split("_")[-1]
+        else:
+            sid = opts.get("--session-id") or str(uuid.uuid4())
+            sdir.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y-%m-%dT%H-%M-%S")
+            existing = list(sdir.rglob(f"*_{sid}.jsonl"))
+            f = existing[0] if existing else sdir / f"{ts}_{sid}.jsonl"
+            with open(f, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "session", "id": sid}) + "\n")
+
+    sleep = float(os.environ.get("MOCK_PI_SLEEP") or 0)
+    if os.environ.get("MOCK_PI_SLEEP_ON") and os.environ["MOCK_PI_SLEEP_ON"] in prompt:
+        sleep = max(sleep, 30.0)
+    if sleep:
+        time.sleep(sleep)
+
+    fail_on = os.environ.get("MOCK_PI_FAIL_ON")
+    fail = os.environ.get("MOCK_PI_FAIL") == "1" or bool(fail_on and fail_on in prompt)
+
+    task = prompt.split("## Task", 1)[1].strip() if "## Task" in prompt else prompt
+    reply = os.environ.get("MOCK_PI_REPLY") or f"mock-ok: {task[:300]}"
+    if opts.get("--session"):
+        reply += f" [resumed {sid}]"
+
+    if opts.get("--mode") == "json":
+        if sid:
+            print(json.dumps({"type": "session", "version": 3, "id": sid,
+                              "timestamp": "2026-01-01T00:00:00.000Z", "cwd": os.getcwd()}))
+        print(json.dumps({"type": "agent_start"}))
+        if not fail:
+            msg = {"role": "assistant", "content": [{"type": "text", "text": reply}]}
+            print(json.dumps({"type": "message_end", "message": msg}, ensure_ascii=False))
+            print(json.dumps({"type": "agent_end", "messages": [msg]}, ensure_ascii=False))
+    elif not fail:
+        print(reply)
+    if fail:
+        print("Error: mock provider failure (simulated)", file=sys.stderr)
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
