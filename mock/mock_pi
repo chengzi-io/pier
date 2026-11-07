@@ -4,13 +4,22 @@
 Shaped after real Pi 1.5.0 behaviour that pier depends on:
 - unknown options -> "Error: Unknown option: X", exit 1
 - `--mode json` session event: {"type":"session","version":3,"id","timestamp","cwd"} (no file path)
+- session file <session-dir>/--<cwd with / -> ->--/<ts>_<id>.jsonl holding a session header
+  and {"type":"message","message":{"role":"user"|"assistant",...}} entries; the user
+  message is written before the model "thinks", the assistant reply after
 - `--session REF` that matches nothing -> "No session found matching", exit 1
 - piped stdin is prepended to the prompt (pier must pass /dev/null)
 - `@path` positional includes the file text in the prompt
+- assistant entries carry a `usage` block {input, output, cacheRead, cacheWrite,
+  totalTokens, cost:{input,output,total}} like real Pi 1.4.0; MOCK_PI_USAGE=<in>,<out>
+  overrides the default
 
 Env: MOCK_PI_RECORD (file, last argv), MOCK_PI_RECORD_DIR (one file per call),
 MOCK_PI_FAIL=1, MOCK_PI_FAIL_ON=<substring of prompt>, MOCK_PI_SLEEP=<s>,
-MOCK_PI_SLEEP_ON=<substring>, MOCK_PI_REPLY=<text>.
+MOCK_PI_SLEEP_ON=<substring>, MOCK_PI_REPLY=<text>,
+MOCK_PI_STOP=error|aborted|length (final assistant stopReason; error/aborted first write
+an intermediate "let me look" text + tool call, as a real failing turn can; print mode
+then exits 1, JSON mode exits 0 like real Pi).
 """
 from __future__ import annotations
 
@@ -30,6 +39,11 @@ MULTI_VALUE_FLAGS = {"--skill", "--extension", "-e", "--append-system-prompt"}
 BOOL_FLAGS = {"--print", "-p", "--no-session", "--no-tools", "--no-builtin-tools", "--continue",
               "-c", "--resume", "-r", "--offline", "--no-extensions", "--no-skills", "--no-mcp",
               "--no-context-files", "-nc", "--approve", "--no-approve", "--verbose"}
+
+
+def write_entry(path: Path, entry: dict) -> None:
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def main() -> int:
@@ -95,26 +109,30 @@ def main() -> int:
 
     sdir = Path(opts.get("--session-dir") or (Path.cwd() / ".mock-sessions"))
     sid = None
+    sfile = None
     if not opts.get("--no-session"):
         ref = opts.get("--session")
         if ref:
             cand = Path(ref)
-            if cand.is_file():
-                sid = cand.stem.split("_")[-1]
-            else:
-                hits = list(sdir.rglob(f"*{ref}*.jsonl")) if sdir.is_dir() else []
-                if not hits:
-                    print(f"No session found matching '{ref}'", file=sys.stderr)
-                    return 1
-                sid = hits[0].stem.split("_")[-1]
+            hits = [cand] if cand.is_file() else (list(sdir.rglob(f"*{ref}*.jsonl")) if sdir.is_dir() else [])
+            if not hits:
+                print(f"No session found matching '{ref}'", file=sys.stderr)
+                return 1
+            sfile = hits[0]
+            sid = sfile.stem.split("_")[-1]
         else:
             sid = opts.get("--session-id") or str(uuid.uuid4())
-            sdir.mkdir(parents=True, exist_ok=True)
-            ts = time.strftime("%Y-%m-%dT%H-%M-%S")
-            existing = list(sdir.rglob(f"*_{sid}.jsonl"))
-            f = existing[0] if existing else sdir / f"{ts}_{sid}.jsonl"
-            with open(f, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"type": "session", "id": sid}) + "\n")
+            existing = list(sdir.rglob(f"*_{sid}.jsonl")) if sdir.is_dir() else []
+            if existing:
+                sfile = existing[0]
+            else:
+                proj = sdir / ("--" + os.getcwd().strip("/").replace("/", "-") + "--")
+                proj.mkdir(parents=True, exist_ok=True)
+                sfile = proj / f"{time.strftime('%Y-%m-%dT%H-%M-%S')}_{sid}.jsonl"
+                write_entry(sfile, {"type": "session", "version": 3, "id": sid,
+                                    "timestamp": "2026-01-01T00:00:00.000Z", "cwd": os.getcwd()})
+        write_entry(sfile, {"type": "message", "message": {
+            "role": "user", "content": [{"type": "text", "text": prompt}]}})
 
     sleep = float(os.environ.get("MOCK_PI_SLEEP") or 0)
     if os.environ.get("MOCK_PI_SLEEP_ON") and os.environ["MOCK_PI_SLEEP_ON"] in prompt:
@@ -125,10 +143,29 @@ def main() -> int:
     fail_on = os.environ.get("MOCK_PI_FAIL_ON")
     fail = os.environ.get("MOCK_PI_FAIL") == "1" or bool(fail_on and fail_on in prompt)
 
-    task = prompt.split("## Task", 1)[1].strip() if "## Task" in prompt else prompt
-    reply = os.environ.get("MOCK_PI_REPLY") or f"mock-ok: {task[:300]}"
+    reply = os.environ.get("MOCK_PI_REPLY") or f"mock-ok: {prompt[:300]}"
     if opts.get("--session"):
         reply += f" [resumed {sid}]"
+    stop = os.environ.get("MOCK_PI_STOP") or "stop"
+    usage_in, usage_out = 1234, 567
+    if os.environ.get("MOCK_PI_USAGE"):
+        usage_in, usage_out = (int(x) for x in os.environ["MOCK_PI_USAGE"].split(","))
+    usage = {"input": usage_in, "output": usage_out, "cacheRead": 0, "cacheWrite": 0,
+             "totalTokens": usage_in + usage_out,
+             "cost": {"input": 0.003, "output": 0.008, "total": 0.011}}
+    msg = {"role": "assistant", "content": [{"type": "text", "text": reply}], "stopReason": stop,
+           "usage": usage}
+    if stop in ("error", "aborted"):
+        msg = {"role": "assistant", "content": [], "stopReason": stop,
+               "errorMessage": f"mock {stop}: 529 overloaded", "usage": usage}
+    if sfile and not fail:
+        if stop in ("error", "aborted"):
+            write_entry(sfile, {"type": "message", "message": {
+                "role": "assistant", "stopReason": "toolUse",
+                "content": [{"type": "text", "text": "let me look"}, {"type": "toolCall", "name": "ls"}]}})
+            write_entry(sfile, {"type": "message", "message": {
+                "role": "toolResult", "content": [{"type": "text", "text": "a.py"}]}})
+        write_entry(sfile, {"type": "message", "message": msg})
 
     if opts.get("--mode") == "json":
         if sid:
@@ -136,11 +173,13 @@ def main() -> int:
                               "timestamp": "2026-01-01T00:00:00.000Z", "cwd": os.getcwd()}))
         print(json.dumps({"type": "agent_start"}))
         if not fail:
-            msg = {"role": "assistant", "content": [{"type": "text", "text": reply}]}
             print(json.dumps({"type": "message_end", "message": msg}, ensure_ascii=False))
             print(json.dumps({"type": "agent_end", "messages": [msg]}, ensure_ascii=False))
     elif not fail:
         print(reply)
+        if stop != "stop":
+            print(f"Error: {msg.get('errorMessage') or stop}", file=sys.stderr)
+            return 1
     if fail:
         print("Error: mock provider failure (simulated)", file=sys.stderr)
         return 3

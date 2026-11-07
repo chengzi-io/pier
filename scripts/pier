@@ -1,4 +1,1701 @@
-#!/usr/bin/env bash
-set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec python3 "$ROOT/pier.py" "$@"
+#!/usr/bin/env python3
+"""pier — run named Pi subagents from agent Markdown + frontmatter.
+
+Borrows the agent Markdown format of nicobailon/pi-subagents (portable fields
+only). One `pier run` -> one `pi` invocation; `send` reuses its session. No
+nesting, no extension runtime, no dependency on the pi-subagents extension.
+Does not install Pi, manage API keys, or rewrite Pi config.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from shutil import which
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+VERSION = "0.1.0"
+
+# Linux MAX_ARG_STRLEN is 128 KiB per argv element; stay well below it.
+INLINE_PROMPT_MAX_BYTES = 100_000
+STDERR_TAIL_CHARS = 600
+# A reply longer than this is spilled to $PIER_HOME/out/<sid>.md and stdout gets
+# a preview + the spill path: the caller reads the file only if it needs the rest.
+DEFAULT_MAX_CHARS = 24_000
+PREVIEW_CHARS = 2_000
+
+
+class PierError(Exception):
+    """User-facing error; CLI prints `error: ...` and exits 2."""
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter field catalog (keep in sync with README "Frontmatter mapping")
+# ---------------------------------------------------------------------------
+
+# Portable fields that change the Pi invocation.
+MAPPED_FIELDS = (
+    "name", "tools", "excludeTools", "model", "thinking", "defaultProvider",
+    "systemPromptMode", "skills", "skill", "skillPath",
+    "extensions", "subagentOnlyExtensions",
+    "inheritProjectContext", "inheritSkills",
+)
+# Selection / display only; never changes the Pi invocation.
+META_FIELDS = ("description",)
+# Identity is `name` only (no package/aliases). Other fields (advertise, async,
+# launcher, timeoutMs, acceptance*, memory, output, nested*, inheritGlobalContext,
+# ...) are ignored; `validate` and `--dry-run` report them.
+
+# pi-subagents runtime tool names; not native Pi tools. Dropped from tools lists.
+EXTENSION_ONLY_TOOLS = frozenset(
+    {"contact_supervisor", "intercom", "bg_wait", "structured_output", "watchdog_diff", "subagent"}
+)
+
+THINKING_SUFFIX_RE = re.compile(r":(off|minimal|low|medium|high|xhigh|max)\s*$", re.I)
+
+TRUE_RE = re.compile(r"^(1|true|yes|on)$", re.I)
+FALSE_RE = re.compile(r"^(0|false|no|off)$", re.I)
+
+# ---------------------------------------------------------------------------
+# TOON 4.4 encoder (deterministic; no decoder). Spec: https://toonformat.dev
+# Spec §9.1 empty arrays are `key: []` / `[]` (NOT legacy `key[0]:`).
+# Spec §7.1 newlines in strings are quoted `\n` (TOON has no YAML block scalars).
+# ---------------------------------------------------------------------------
+
+_TOON_NUMERIC_LIKE = re.compile(r"^[+-]?[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?$", re.I)
+_TOON_UNQUOTED_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+_TOON_INDENT = 2
+
+
+def _toon_escape(s: str) -> str:
+    out: List[str] = []
+    for ch in s:
+        o = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif o < 0x20:
+            out.append(f"\\u{o:04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _toon_needs_quote(s: str) -> bool:
+    if s == "" or s in ("true", "false", "null"):
+        return True
+    if s[0] in "-#" or s[0] in " \t" or s[-1] in " \t":
+        return True
+    if _TOON_NUMERIC_LIKE.match(s):
+        return True
+    for ch in s:
+        if ch in ':"\\[]{},' or ord(ch) < 0x20:
+            return True
+    return False
+
+
+def _toon_key(k: str) -> str:
+    return k if _TOON_UNQUOTED_KEY.match(k) else '"' + _toon_escape(k) + '"'
+
+
+def _toon_prim(v: Any) -> str:
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int) and not isinstance(v, bool):
+        return str(v)
+    if isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")):
+            return "null"
+        if v == int(v) and abs(v) < 1e21:
+            return str(int(v))
+        return format(v, ".15g")
+    s = str(v)
+    if _toon_needs_quote(s):
+        return '"' + _toon_escape(s) + '"'
+    return s
+
+
+def _toon_is_prim(v: Any) -> bool:
+    return not isinstance(v, (dict, list))
+
+
+def _toon_column_uniform(vals: List[Any]) -> bool:
+    """§9.3: uniform-primitive or nested-uniform column."""
+    if all(_toon_is_prim(v) for v in vals):
+        return True
+    if all(isinstance(v, dict) and v for v in vals):
+        keys0 = list(vals[0].keys())
+        if not keys0:
+            return False
+        if not all(set(v.keys()) == set(keys0) for v in vals):
+            return False
+        for k in keys0:
+            if not _toon_column_uniform([v[k] for v in vals]):
+                return False
+        return True
+    return False
+
+
+def _toon_uniform_objects(arr: List[Any]) -> bool:
+    """§9.3 tabular detection for an array of objects (supports nested-uniform)."""
+    if not arr or not all(isinstance(x, dict) and x for x in arr):
+        return False
+    keys0 = list(arr[0].keys())
+    if not all(set(o.keys()) == set(keys0) for o in arr):
+        return False
+    for k in keys0:
+        if not _toon_column_uniform([o[k] for o in arr]):
+            return False
+    return True
+
+
+def _toon_keyed_tabular_ok(obj: Dict[str, Any]) -> bool:
+    """§9.5: ≥2 entries, every value a non-empty object, columns uniform."""
+    if len(obj) < 2:
+        return False
+    vals = list(obj.values())
+    if not all(isinstance(v, dict) and v for v in vals):
+        return False
+    return _toon_uniform_objects(vals)
+
+
+def _toon_field_entry(key: str, sample: Any) -> str:
+    """One field list entry, with nested field group when sample is nested-uniform object."""
+    ks = _toon_key(str(key))
+    if isinstance(sample, dict) and sample:
+        inner = ",".join(_toon_field_entry(str(sk), sample[sk]) for sk in sample.keys())
+        return f"{ks}{{{inner}}}"
+    return ks
+
+
+def _toon_fields_seg(sample_obj: Dict[str, Any]) -> str:
+    return "{" + ",".join(_toon_field_entry(str(k), sample_obj[k]) for k in sample_obj.keys()) + "}"
+
+
+def _toon_leaf_cells(obj: Dict[str, Any], sample: Dict[str, Any]) -> List[str]:
+    """Depth-first leaf primitives matching header field order from sample."""
+    cells: List[str] = []
+    for k in sample.keys():
+        sv = sample[k]
+        v = obj[k]
+        if isinstance(sv, dict) and sv:
+            cells.extend(_toon_leaf_cells(v, sv))
+        else:
+            cells.append(_toon_prim(v))
+    return cells
+
+
+def _toon_encode_keyed(key: Optional[str], obj: Dict[str, Any], indent: int) -> List[str]:
+    """Keyed tabular form §9.5. key=None for root."""
+    pad = " " * (_TOON_INDENT * indent)
+    vals = list(obj.values())
+    sample = vals[0]
+    n = len(obj)
+    head = (f"{pad}{_toon_key(key)}[{n}:]" if key else f"{pad}[{n}:]") + _toon_fields_seg(sample) + ":"
+    lines = [head]
+    ipad = " " * (_TOON_INDENT * (indent + 1))
+    for ek, ev in obj.items():
+        cells = ",".join(_toon_leaf_cells(ev, sample))
+        lines.append(f"{ipad}{_toon_key(str(ek))}: {cells}")
+    return lines
+
+
+def _toon_encode_list(key: str, arr: List[Any], indent: int) -> List[str]:
+    """Encode an array. key="" for root/keyless; indent = header line depth."""
+    pad = " " * (_TOON_INDENT * indent)
+    n = len(arr)
+    # §9.1 empty arrays: key: [] / root []
+    if n == 0:
+        if key:
+            return [f"{pad}{_toon_key(key)}: []"]
+        return [f"{pad}[]"] if indent else ["[]"]
+    head = f"{pad}{_toon_key(key)}[{n}]" if key else f"{pad}[{n}]"
+    # inline primitive array
+    if all(_toon_is_prim(x) for x in arr):
+        return [head + ": " + ",".join(_toon_prim(x) for x in arr)]
+    # tabular (§9.3) including nested-uniform columns
+    if _toon_uniform_objects(arr):
+        sample = arr[0]
+        lines = [head + _toon_fields_seg(sample) + ":"]
+        ipad = " " * (_TOON_INDENT * (indent + 1))
+        for obj in arr:
+            lines.append(ipad + ",".join(_toon_leaf_cells(obj, sample)))
+        return lines
+    # list form (§9.2 / §9.4)
+    lines = [head + ":"]
+    item_depth = indent + 1
+    ipad = " " * (_TOON_INDENT * item_depth)
+    for item in arr:
+        if isinstance(item, dict):
+            lines.extend(_toon_encode_list_item_object(item, item_depth))
+        elif isinstance(item, list):
+            # keyless header as list item (§9.2 / §9.4)
+            sub = _toon_encode_list("", item, item_depth)
+            # merge onto "- " prefix: header stands at item_depth
+            lines.append(ipad + "- " + sub[0][len(ipad):])
+            lines.extend(sub[1:])
+        else:
+            lines.append(ipad + "- " + _toon_prim(item))
+    return lines
+
+
+def _toon_encode_list_item_object(obj: Dict[str, Any], item_depth: int) -> List[str]:
+    """§10: first field on hyphen line; siblings at item_depth+1; nested content at +2 from hyphen."""
+    ipad = " " * (_TOON_INDENT * item_depth)
+    if not obj:
+        return [ipad + "-"]
+    lines: List[str] = []
+    first = True
+    for k, v in obj.items():
+        ks = _toon_key(str(k))
+        if first:
+            first = False
+            # First field stands at depth item_depth+1 for scope; content at item_depth+2.
+            if isinstance(v, dict):
+                if _toon_keyed_tabular_ok(v):
+                    sub = _toon_encode_keyed(str(k), v, item_depth + 1)
+                    hdr_pad = " " * (_TOON_INDENT * (item_depth + 1))
+                    lines.append(ipad + "- " + sub[0][len(hdr_pad):])
+                    lines.extend(sub[1:])
+                elif not v:
+                    lines.append(ipad + f"- {ks}:")
+                else:
+                    lines.append(ipad + f"- {ks}:")
+                    lines.extend(_toon_encode(v, item_depth + 2))
+            elif isinstance(v, list):
+                # Array header on hyphen; logical header depth = item_depth+1; rows at item_depth+2
+                sub = _toon_encode_list(str(k), v, item_depth + 1)
+                hdr_pad = " " * (_TOON_INDENT * (item_depth + 1))
+                lines.append(ipad + "- " + sub[0][len(hdr_pad):])
+                lines.extend(sub[1:])
+            else:
+                lines.append(ipad + f"- {ks}: {_toon_prim(v)}")
+        else:
+            # Sibling fields at depth item_depth+1
+            field_depth = item_depth + 1
+            fpad = " " * (_TOON_INDENT * field_depth)
+            if isinstance(v, dict):
+                if _toon_keyed_tabular_ok(v):
+                    lines.extend(_toon_encode_keyed(str(k), v, field_depth))
+                elif not v:
+                    lines.append(f"{fpad}{ks}:")
+                else:
+                    lines.append(f"{fpad}{ks}:")
+                    lines.extend(_toon_encode(v, field_depth + 1))
+            elif isinstance(v, list):
+                lines.extend(_toon_encode_list(str(k), v, field_depth))
+            else:
+                lines.append(f"{fpad}{ks}: {_toon_prim(v)}")
+    return lines
+
+
+def _toon_encode(value: Any, indent: int = 0) -> List[str]:
+    pad = " " * (_TOON_INDENT * indent)
+    if isinstance(value, dict):
+        if not value:
+            return []  # empty root/nested object body (§8); caller emits `key:` for fields
+        # Root object that itself is keyed-tabular (§9.5)
+        if indent == 0 and _toon_keyed_tabular_ok(value):
+            return _toon_encode_keyed(None, value, 0)
+        lines: List[str] = []
+        for k, v in value.items():
+            key = _toon_key(str(k))
+            if isinstance(v, dict):
+                if _toon_keyed_tabular_ok(v):
+                    lines.extend(_toon_encode_keyed(str(k), v, indent))
+                elif not v:
+                    lines.append(f"{pad}{key}:")
+                else:
+                    lines.append(f"{pad}{key}:")
+                    lines.extend(_toon_encode(v, indent + 1))
+            elif isinstance(v, list):
+                lines.extend(_toon_encode_list(str(k), v, indent))
+            else:
+                lines.append(f"{pad}{key}: {_toon_prim(v)}")
+        return lines
+    if isinstance(value, list):
+        return _toon_encode_list("", value, indent)
+    return [pad + _toon_prim(value)]
+
+
+def encode_toon(value: Any) -> str:
+    """Encode JSON-compatible value as compact TOON 4.4 (no trailing newline)."""
+    lines = _toon_encode(value, 0)
+    return "\n".join(lines)
+
+
+
+def classify_fields(fm: Dict[str, str]) -> Dict[str, List[str]]:
+    mapped = [k for k in fm if k in MAPPED_FIELDS]
+    meta = [k for k in fm if k in META_FIELDS]
+    ignored = sorted(k for k in fm if k not in MAPPED_FIELDS and k not in META_FIELDS)
+    return {"mapped": mapped, "meta": meta, "ignored": ignored}
+
+
+def parse_bool(val: Optional[str]) -> Optional[bool]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    if TRUE_RE.match(s):
+        return True
+    if FALSE_RE.match(s):
+        return False
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Paths / small helpers
+# ---------------------------------------------------------------------------
+
+def skill_root() -> Path:
+    """The skill root (this repository): scripts/pier -> repo root."""
+    return Path(__file__).resolve().parent.parent
+
+
+def pier_home() -> Path:
+    """Pier state root: sessions/ and user agents/. Default ~/.pier, override with
+    PIER_HOME. Independent of --cwd, so nothing runtime lands in projects."""
+    env = os.environ.get("PIER_HOME")
+    if env:
+        return Path(env).expanduser().resolve()
+    return (Path.home() / ".pier").resolve()
+
+
+def ensure_dir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def write_json(path: Path, data: Any) -> None:
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}.{threading.get_ident()}")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_json(path: Path) -> Dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter parser (mirrors pi-subagents src/agents/frontmatter.ts closely
+# enough for agent files: flat keys, block scalars, `- item` lists)
+# ---------------------------------------------------------------------------
+
+_LIST_KEYS = {"tools", "excludeTools", "mutationTools", "extensions", "subagentOnlyExtensions"}
+
+
+def parse_frontmatter(content: str) -> Tuple[Dict[str, str], str]:
+    fm: Dict[str, str] = {}
+    text = content.replace("\r\n", "\n")
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    if not text.startswith("---"):
+        return fm, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return fm, text
+    block = text[4:end]
+    body = text[end + 4:].lstrip("\n").rstrip()
+
+    key: Optional[str] = None
+    buf: Optional[List[str]] = None
+    indent0 = 0
+    folded = literal = False
+
+    def flush() -> None:
+        nonlocal key, buf, folded, literal
+        if key is not None and buf is not None:
+            fm[key] = _flush_block(buf, folded, literal)
+        key, buf, folded, literal = None, None, False, False
+
+    for line in block.split("\n"):
+        m_ind = re.search(r"\S|$", line)
+        indent = m_ind.start() if m_ind else 0
+        trimmed = line.strip()
+        if trimmed.startswith("#") and not folded and not literal:
+            continue
+        if key is not None and buf is not None and (indent > indent0 or trimmed == ""):
+            buf.append(line)
+            continue
+        flush()
+        m = re.match(r"^([\w-]+):\s*(.*)$", line)
+        if not m:
+            continue
+        k, raw = m.group(1), m.group(2).strip()
+        q = raw[:1]
+        quoted_list = k in _LIST_KEYS and q in {'"', "'"} and (f"{q}," in raw or f", {q}" in raw)
+        is_quoted = not quoted_list and q in {'"', "'"} and raw.endswith(q) and len(raw) >= 2
+        value = raw[1:-1] if is_quoted else raw
+        is_folded = not is_quoted and raw in {">", ">-"}
+        is_literal = not is_quoted and raw in {"|", "|-"}
+        if value == "" or is_folded or is_literal:
+            key, buf, indent0, folded, literal = k, [], indent, is_folded, is_literal
+        else:
+            fm[k] = value
+    flush()
+    return fm, body
+
+
+def _flush_block(lines: List[str], folded: bool, literal: bool) -> str:
+    lines = list(lines)
+    if not folded and not literal:
+        while lines and lines[0] == "":
+            lines.pop(0)
+        last = max((i for i, l in enumerate(lines) if l.strip()), default=-1)
+        lines = lines[: last + 1] if last >= 0 else []
+    raw = "\n".join(lines)
+    m = re.search(r"^[ \t]+(?=\S)", raw, re.M)
+    if m:
+        raw = re.sub(rf"^{re.escape(m.group(0))}", "", raw, flags=re.M)
+    if folded:
+        return _fold(raw)
+    return raw.rstrip("\n") if literal else raw
+
+
+def _fold(block: str) -> str:
+    out, has, prev_more, blanks = "", False, False, 0
+    for line in block.split("\n"):
+        cur = line.rstrip()
+        if not cur.strip():
+            if has:
+                blanks += 1
+            continue
+        more = len(cur) > len(cur.lstrip())
+        if has:
+            if blanks:
+                out += "\n" * (blanks + (1 if prev_more or more else 0))
+            else:
+                out += "\n" if prev_more or more else " "
+        out += cur
+        has, prev_more, blanks = True, more, 0
+    return out.strip()
+
+
+def parse_list(raw: Optional[str]) -> Optional[List[str]]:
+    if raw is None:
+        return None
+    out: List[str] = []
+    for line in raw.split("\n"):
+        v = line.strip()
+        m = re.match(r"^-\s+(.+)$", v)
+        item = m.group(1) if m else v
+        if m and not re.match(r"^['\"]", item):
+            item = re.sub(r"(?:^|\s)#.*$", "", item)
+        for part in item.split(","):
+            part = part.strip()
+            if len(part) >= 2 and part[0] == part[-1] and part[0] in "'\"":
+                part = part[1:-1]
+            if part:
+                out.append(part)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Agent discovery
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AgentDef:
+    name: str
+    path: Path
+    source: str  # skill | scan | user | project | file
+    description: str = ""
+    frontmatter: Dict[str, str] = field(default_factory=dict)
+    body: str = ""
+    tools: Optional[List[str]] = None  # None = key absent; [] = empty -> --no-tools
+    exclude_tools: Optional[List[str]] = None
+    model: Optional[str] = None
+    thinking: Optional[str] = None
+    default_provider: Optional[str] = None
+    system_prompt_mode: str = "replace"  # replace | append
+    skills: Optional[List[str]] = None  # None=omitted; []=empty -> --no-skills
+    skill_paths: Optional[List[str]] = None  # relative to agent md dir
+    extensions: Optional[List[str]] = None  # None=omitted; []=empty -> --no-extensions
+    subagent_only_extensions: Optional[List[str]] = None
+    inherit_project_context: Optional[bool] = None
+    inherit_skills: Optional[bool] = None
+    fields: Dict[str, List[str]] = field(default_factory=dict)
+
+
+_SKIP_DIRS = frozenset({"skills", "node_modules", "__pycache__", ".git", ".pier",
+                        "docs", "tests", "scripts", "mock", "dist", "build"})
+_SKIP_FILES = frozenset({"SKILL.md", "README.md", "CHANGELOG.md", "LICENSE.md", "CONTRIBUTING.md"})
+
+
+def discover_md_files(root: Path) -> List[Path]:
+    if not root.is_dir():
+        return []
+    files = []
+    for p in sorted(root.rglob("*.md")):
+        if p.name.startswith(".") or p.name.endswith(".chain.md") or p.name in _SKIP_FILES:
+            continue
+        if any(part in _SKIP_DIRS for part in p.relative_to(root).parts[:-1]):
+            continue
+        files.append(p)
+    return files
+
+
+def load_agent_file(path: Path, source: str) -> Optional[AgentDef]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    fm, body = parse_frontmatter(text)
+    name = (fm.get("name") or path.stem).strip()
+    if not name:
+        return None
+    tools = parse_list(fm["tools"]) if "tools" in fm else None
+    model = (fm.get("model") or "").strip()
+    if model.lower() == "inherit":
+        model = ""
+    thinking = (fm.get("thinking") or "").strip() or None
+    if thinking and thinking.lower() == "false":
+        thinking = "off"
+    spm = (fm.get("systemPromptMode") or "replace").strip().lower() or "replace"
+    if spm not in ("replace", "append"):
+        spm = "replace"
+    # skills / skill (synonym); skillPath is path-based private candidates
+    skills = None
+    if "skills" in fm or "skill" in fm:
+        skills = []
+        for key in ("skills", "skill"):
+            if key in fm:
+                skills.extend(a for a in (parse_list(fm.get(key)) or []) if a)
+    skill_paths = parse_list(fm["skillPath"]) if "skillPath" in fm else None
+    extensions = parse_list(fm["extensions"]) if "extensions" in fm else None
+    soe = parse_list(fm["subagentOnlyExtensions"]) if "subagentOnlyExtensions" in fm else None
+    return AgentDef(
+        name=name,
+        path=path.resolve(),
+        source=source,
+        description=(fm.get("description") or "").strip(),
+        frontmatter=fm,
+        body=body,
+        tools=tools,
+        exclude_tools=parse_list(fm.get("excludeTools")),
+        model=model or None,
+        thinking=thinking,
+        default_provider=(fm.get("defaultProvider") or "").strip() or None,
+        system_prompt_mode=spm,
+        skills=skills,
+        skill_paths=skill_paths,
+        extensions=extensions,
+        subagent_only_extensions=soe,
+        inherit_project_context=parse_bool(fm.get("inheritProjectContext")),
+        inherit_skills=parse_bool(fm.get("inheritSkills")),
+        fields=classify_fields(fm),
+    )
+
+
+def user_agents_dir() -> Path:
+    return pier_home() / "agents"
+
+
+def project_agents_dir(cwd: Path) -> Path:
+    return cwd / ".pier" / "agents"
+
+
+def agent_layers(cwd: Path) -> List[Tuple[str, Path]]:
+    """Lookup layers, priority low -> high (later wins on the same name).
+
+    1. skill   <skill>/agents            bundled examples/templates (read-only)
+    2. scan    $PIER_AGENT_DIRS
+    3. user    $PIER_HOME/agents (default ~/.pier/agents)
+    4. project <cwd>/.pier/agents        default target of `pier agents new`
+
+    Pier never reads pi-subagents dirs, ~/.pi/agent/agents, .pi/agents, or .agents.
+    """
+    layers: List[Tuple[str, Path]] = [("skill", skill_root() / "agents")]
+    for part in os.environ.get("PIER_AGENT_DIRS", "").split(os.pathsep):
+        if part.strip():
+            layers.append(("scan", Path(part.strip()).expanduser()))
+    layers.append(("user", user_agents_dir()))
+    layers.append(("project", project_agents_dir(cwd)))
+    return layers
+
+
+def collect_agents(cwd: Path) -> Dict[str, AgentDef]:
+    """Collect agents keyed by `name` only. Later layers overwrite same name."""
+    layers = agent_layers(cwd)
+    agents: Dict[str, AgentDef] = {}
+    for source, root in layers:
+        for path in discover_md_files(root):
+            a = load_agent_file(path, source)
+            if a is None:
+                continue
+            agents[a.name] = a
+    return agents
+
+
+def load_agent_path(path: Path) -> AgentDef:
+    if not path.is_file():
+        raise PierError(f"agent file not found: {path}")
+    a = load_agent_file(path, "file")
+    if a is None:
+        raise PierError(f"cannot load agent file: {path}")
+    return a
+
+
+def resolve_agent(name: str, agents: Dict[str, AgentDef]) -> AgentDef:
+    if name in agents:
+        return agents[name]
+    raise PierError(f"unknown agent {name!r}. Available: "
+                    + (", ".join(sorted(agents)) or "(none)"))
+
+
+# ---------------------------------------------------------------------------
+# Run spec -> Pi argv
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RunSpec:
+    """Everything needed to build one Pi call. CLI values override agent."""
+    cwd: Path
+    agent: AgentDef
+    task: str = ""
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    thinking: Optional[str] = None
+    tools: Optional[str] = None  # CSV for Pi; "" -> --no-tools
+    exclude_tools: Optional[str] = None
+    extra: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)  # ignored-field notices etc.
+
+
+def filter_tool_list(items: List[str], field_name: str, notes: List[str]) -> List[str]:
+    kept, dropped = [], []
+    for t in items:
+        if t in EXTENSION_ONLY_TOOLS or t.startswith("mcp:") or "/" in t \
+                or t.endswith((".ts", ".js", ".mjs", ".cjs")):
+            dropped.append(t)
+        else:
+            kept.append(t)
+    if dropped:
+        notes.append(f"{field_name}: ignored entries not native Pi tool names (no effect): "
+                     + ", ".join(dropped))
+    return kept
+
+
+def resolve_spec(spec: RunSpec) -> RunSpec:
+    """Apply agent frontmatter defaults where the caller did not override."""
+    a = spec.agent
+    cli_thinking = spec.thinking is not None
+    if a:
+        if a.fields.get("ignored"):
+            spec.notes.append("ignored frontmatter (not mapped, no effect): "
+                              + ", ".join(a.fields["ignored"]))
+        if spec.model is None and a.model:
+            spec.model = a.model
+        if spec.tools is None and a.tools is not None:
+            kept = filter_tool_list(a.tools, "tools", spec.notes)
+            spec.tools = ",".join(kept)  # "" -> --no-tools
+        if spec.exclude_tools is None and a.exclude_tools:
+            kept = filter_tool_list(a.exclude_tools, "excludeTools", spec.notes)
+            spec.exclude_tools = ",".join(kept) or None
+        if not cli_thinking and a.thinking:
+            # pi-subagents: a ':level' suffix on model wins over `thinking`.
+            if not (spec.model and THINKING_SUFFIX_RE.search(spec.model)):
+                spec.thinking = a.thinking
+        if spec.provider is None and a.default_provider and spec.model and "/" not in spec.model:
+            spec.provider = a.default_provider
+    if spec.provider and not spec.model:
+        raise PierError("--provider requires --model (Pi constraint)")
+    for x in spec.extra:
+        if x == "--api-key" or x.startswith("--api-key="):
+            raise PierError("--api-key is not accepted in --extra (it would be stored on disk); "
+                            "use the provider's environment variable")
+    return spec
+
+
+def pi_bin_name() -> str:
+    return os.environ.get("PI_BIN") or "pi"
+
+
+def resolve_pi_binary(required: bool = True) -> str:
+    b = pi_bin_name()
+    if os.sep in b or (os.altsep and os.altsep in b):
+        p = Path(b).expanduser()
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p.absolute())
+        found = None
+    else:
+        found = which(b)
+    if found:
+        return found
+    if required:
+        raise PierError(f"Pi CLI not found as {b!r}. pier does not install Pi or manage API keys. "
+                        "Install Pi (https://pi.dev) or set PI_BIN to its absolute path.")
+    return b
+
+
+# ---------------------------------------------------------------------------
+# Pi skills / extensions resource resolution (Pi 1.4+ CLI flags)
+# ---------------------------------------------------------------------------
+
+_PKG_OR_URL_RE = re.compile(r"^(builtin:|npm:|git:|https?://|file:)", re.I)
+
+
+def _read_json_file(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _skill_dirs_from_package_json(pkg_json: Path) -> List[Path]:
+    data = _read_json_file(pkg_json)
+    if not isinstance(data, dict):
+        return []
+    pi = data.get("pi")
+    if not isinstance(pi, dict):
+        return []
+    skills = pi.get("skills")
+    out: List[Path] = []
+    base = pkg_json.parent
+    if isinstance(skills, str):
+        skills = [skills]
+    if isinstance(skills, list):
+        for s in skills:
+            if isinstance(s, str) and s.strip():
+                out.append((base / s).resolve())
+    return out
+
+
+def _settings_skill_paths(settings: Path) -> List[Path]:
+    data = _read_json_file(settings)
+    if not isinstance(data, dict):
+        return []
+    out: List[Path] = []
+    base = settings.parent
+    skills = data.get("skills")
+    if isinstance(skills, str):
+        skills = [skills]
+    if isinstance(skills, list):
+        for s in skills:
+            if isinstance(s, str) and s.strip():
+                p = Path(s).expanduser()
+                out.append((p if p.is_absolute() else (base / p)).resolve())
+    packages = data.get("packages")
+    if isinstance(packages, list):
+        for entry in packages:
+            if isinstance(entry, str) and not _PKG_OR_URL_RE.match(entry) and not entry.startswith("@"):
+                pkg = Path(entry).expanduser()
+                if not pkg.is_absolute():
+                    pkg = (base / pkg)
+                pj = pkg / "package.json" if pkg.is_dir() else None
+                if pj and pj.is_file():
+                    out.extend(_skill_dirs_from_package_json(pj))
+    return out
+
+
+def pi_skill_search_roots(cwd: Path) -> List[Path]:
+    """Ordered skill discovery roots for name resolution (project -> packages -> user).
+
+    Pier resolves names to concrete paths and passes repeated `--skill <path>`
+    (Pi 1.4+ accepts a skill file or directory).
+    """
+    home = Path.home()
+    roots: List[Path] = [
+        cwd / ".pi" / "skills",
+        cwd / ".agents" / "skills",
+    ]
+    roots.extend(_skill_dirs_from_package_json(cwd / "package.json"))
+    nm = cwd / "node_modules"
+    if nm.is_dir():
+        for pkg_json in sorted(nm.glob("*/package.json")) + sorted(nm.glob("@*/*/package.json")):
+            roots.extend(_skill_dirs_from_package_json(pkg_json))
+    roots.extend(_settings_skill_paths(cwd / ".pi" / "settings.json"))
+    roots.append(home / ".pi" / "agent" / "skills")
+    roots.append(home / ".agents" / "skills")
+    roots.extend(_settings_skill_paths(home / ".pi" / "agent" / "settings.json"))
+    seen = set()
+    out: List[Path] = []
+    for r in roots:
+        key = str(r)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+def resolve_named_skill(name: str, cwd: Path) -> Path:
+    """Resolve a skill name to a SKILL.md file or skill directory. Error if missing."""
+    if not name or "/" in name or name.startswith("."):
+        raise PierError(f"invalid skill name {name!r} (use skillPath for paths)")
+    for root in pi_skill_search_roots(cwd):
+        cand_dir = root / name
+        skill_md = cand_dir / "SKILL.md"
+        if skill_md.is_file():
+            return skill_md.resolve()
+        if cand_dir.is_dir():
+            return cand_dir.resolve()
+        cand_file = root / f"{name}.md"
+        if cand_file.is_file():
+            return cand_file.resolve()
+        if root.name == name and (root / "SKILL.md").is_file():
+            return (root / "SKILL.md").resolve()
+        if root.name == name and root.is_dir():
+            return root.resolve()
+    raise PierError(
+        f"skill {name!r} not found in Pi skill locations under {cwd} "
+        f"(checked .pi/skills, .agents/skills, packages, settings, ~/.pi/agent/skills)"
+    )
+
+
+def resolve_skill_path_entry(raw: str, agent_dir: Path) -> Path:
+    """skillPath entry: relative to agent md directory; absolute as-is."""
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (agent_dir / p)
+    p = p.resolve()
+    if not (p.is_file() or p.is_dir()):
+        raise PierError(f"skillPath not found: {raw} (resolved {p})")
+    return p
+
+
+def resolve_extension_entry(raw: str, agent_dir: Path) -> str:
+    """Map an extensions / subagentOnlyExtensions entry to a Pi --extension value.
+
+    Local relative paths resolve against the agent md directory. Absolute paths,
+    builtin:*, npm:*, git:*, http(s):*, file:* pass through unchanged (Pi 1.4+).
+    Missing relative local paths that look like files error; bare tokens pass through.
+    """
+    s = raw.strip()
+    if not s:
+        raise PierError("empty extension entry")
+    if _PKG_OR_URL_RE.match(s) or s.startswith("/"):
+        return s
+    p = Path(s).expanduser()
+    if p.is_absolute():
+        return str(p)
+    cand = (agent_dir / p)
+    if cand.exists():
+        return str(cand.resolve())
+    if "/" in s or s.endswith((".ts", ".js", ".mjs", ".cjs", ".py")) or s in (".", ".."):
+        raise PierError(f"extension path not found: {s} (relative to {agent_dir})")
+    return s
+
+
+def resource_argv(spec: RunSpec) -> List[str]:
+    """Build --skill / --no-skills / --extension / --no-extensions / --no-context-files."""
+    argv: List[str] = []
+    a = spec.agent
+    agent_dir = a.path.parent if a else spec.cwd
+
+    want_no_skills = False
+    skill_paths: List[str] = []
+    if a:
+        if a.inherit_skills is False:
+            want_no_skills = True
+        if a.skills is not None and len(a.skills) == 0:
+            want_no_skills = True
+        if a.skills:
+            for name in a.skills:
+                skill_paths.append(str(resolve_named_skill(name, spec.cwd)))
+        if a.skill_paths:
+            for raw in a.skill_paths:
+                skill_paths.append(str(resolve_skill_path_entry(raw, agent_dir)))
+    seen: set = set()
+    uniq: List[str] = []
+    for p in skill_paths:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    if want_no_skills:
+        argv.append("--no-skills")
+    for p in uniq:
+        argv += ["--skill", p]
+
+    ext_values: List[str] = []
+    ext_key_present = False
+    if a:
+        if a.extensions is not None:
+            ext_key_present = True
+            for raw in a.extensions:
+                ext_values.append(resolve_extension_entry(raw, agent_dir))
+        if a.subagent_only_extensions:
+            for raw in a.subagent_only_extensions:
+                ext_values.append(resolve_extension_entry(raw, agent_dir))
+    seen_e: set = set()
+    uniq_e: List[str] = []
+    for e in ext_values:
+        if e not in seen_e:
+            seen_e.add(e)
+            uniq_e.append(e)
+    if (ext_key_present and a is not None and a.extensions is not None
+            and len(a.extensions) == 0 and not a.subagent_only_extensions):
+        argv.append("--no-extensions")
+    elif uniq_e:
+        # allowlist: disable ambient discovery, then add explicit paths
+        argv.append("--no-extensions")
+        for e in uniq_e:
+            argv += ["--extension", e]
+
+    if a and a.inherit_project_context is False:
+        argv.append("--no-context-files")
+    return argv
+
+
+def build_flags(spec: RunSpec) -> List[str]:
+    """Pi flags that define the agent. Stored per session and replayed by `send`,
+    because Pi does not persist system prompt, tools, skills or extensions."""
+    # Print mode: Pi exits non-zero when the final reply errors or is aborted
+    # (JSON mode exits 0 then). stdout is discarded; the reply comes from the session file.
+    flags = ["--print"]
+    if spec.provider:
+        flags += ["--provider", spec.provider]
+    if spec.model:
+        flags += ["--model", spec.model]
+    if spec.thinking:
+        flags += ["--thinking", spec.thinking]
+    if spec.tools == "":
+        flags += ["--no-tools"]
+    elif spec.tools:
+        flags += ["--tools", spec.tools]
+    if spec.exclude_tools:
+        flags += ["--exclude-tools", spec.exclude_tools]
+    flags += ["--name", spec.agent.name]
+    role = spec.agent.body.strip()
+    if role:
+        if len(role.encode("utf-8")) > INLINE_PROMPT_MAX_BYTES:
+            raise PierError(f"system prompt exceeds {INLINE_PROMPT_MAX_BYTES} bytes")
+        append = spec.agent.system_prompt_mode == "append"
+        flags += ["--append-system-prompt" if append else "--system-prompt", role]
+    # Report contract: the caller sees only the final message, so it must stand
+    # alone. The agent's own append comes first, the contract after.
+    flags += ["--append-system-prompt", REPORT_CONTRACT]
+    flags += resource_argv(spec)
+    flags += list(spec.extra)
+    return flags
+
+
+# ~60 tokens appended to every agent's system prompt (Claude Code does the same
+# for its subagents: their prompt + environment rules).
+REPORT_CONTRACT = (
+    "You run as a delegated subagent. The caller sees only your final message. "
+    "Make it self-contained: result first, evidence as path:line, no preamble. "
+    "If blocked, state exactly what you need."
+)
+
+
+def prompt_args(prompt: str, prompt_file: Path, *, write: bool) -> List[str]:
+    if len(prompt.encode("utf-8")) <= INLINE_PROMPT_MAX_BYTES:
+        return ["--", prompt]
+    # Too large for one argv element: Pi `@path` includes the file in the first prompt.
+    if write:
+        prompt_file.write_text(prompt, encoding="utf-8")
+    return ["@" + str(prompt_file)]
+
+
+# ---------------------------------------------------------------------------
+# Sessions: $PIER_HOME/sessions holds Pi's session files plus one
+# <sid>.pier.json (cwd + flags + handle) per session.
+#
+# The handle is the first 8 hex chars of the session uuid: short enough to
+# type, unique in practice (collision -> pier names the alternatives). `--name`
+# also registers a human handle; a duplicate name points to the newest session.
+# ---------------------------------------------------------------------------
+
+def sessions_dir(home: Path) -> Path:
+    return home / "sessions"
+
+
+def sidecar_path(home: Path, sid: str) -> Path:
+    return sessions_dir(home) / f"{sid}.pier.json"
+
+
+def sid_to_ref(sid: str) -> str:
+    return sid[:8]
+
+
+def load_sidecar(home: Path, sid: str) -> Dict[str, Any]:
+    p = sidecar_path(home, sid)
+    if not p.is_file():
+        raise PierError(f"unknown session {sid!r} (no {p})")
+    return read_json(p)
+
+
+def iter_sidecars(home: Path) -> List[Tuple[str, Dict[str, Any], float]]:
+    """All sessions' sidecars, newest mtime first: (sid, data, mtime)."""
+    out = []
+    for p in sessions_dir(home).glob("*.pier.json"):
+        try:
+            out.append((p.name[:-len(".pier.json")], read_json(p), p.stat().st_mtime))
+        except (PierError, OSError):
+            continue  # unreadable sidecar: not ours to diagnose mid-listing
+    return sorted(out, key=lambda t: t[2], reverse=True)
+
+
+def resolve_ref(home: Path, ref: str) -> str:
+    """A handle -> sid. Accepts the full uuid, an 8+-char unique prefix of one,
+    or a `--name` handle (newest wins)."""
+    if len(ref) == 36 and ref.count("-") == 4:
+        load_sidecar(home, ref)  # raises the unknown-session error if absent
+        return ref
+    prefix_hits: List[str] = []
+    name_hit: Optional[str] = None
+    for sid, data, _ in iter_sidecars(home):  # newest mtime first
+        if sid.startswith(ref):
+            prefix_hits.append(sid)
+        if (data.get("name") or "") == ref and name_hit is None:
+            name_hit = sid  # same --name twice: newest wins
+    if prefix_hits:
+        if len(prefix_hits) > 1:
+            alts = ", ".join(f"{sid_to_ref(s)}" for s in sorted(prefix_hits))
+            raise PierError(f"ambiguous session {ref!r} (matches {alts}); use more chars")
+        return prefix_hits[0]
+    if name_hit is not None:
+        return name_hit
+    raise PierError(f"unknown session {ref!r}" + recent_refs_hint(home))
+
+
+def recent_refs_hint(home: Path) -> str:
+    recent = iter_sidecars(home)[:5]
+    if not recent:
+        return ""
+    names = ", ".join(f"{sid_to_ref(sid)} ({data.get('name') or '?'})"
+                      for sid, data, _ in recent)
+    return f"; recent sessions: {names}"
+
+
+def find_session_file(home: Path, sid: str) -> Optional[Path]:
+    hits = sorted(sessions_dir(home).rglob(f"*_{sid}.jsonl"))
+    return hits[0] if hits else None
+
+
+# Pi persists only terminal stop reasons; these mean the turn did not finish normally.
+FAILED_STOPS = ("error", "aborted")
+
+
+@dataclass
+class Turn:
+    reply: str  # last non-empty assistant text since the last user message
+    stop: Optional[str]  # stopReason of the last assistant message
+    error: str  # its errorMessage
+    usage: Optional[Dict[str, Any]] = None  # its usage block, when Pi wrote one
+
+
+def last_turn(session_file: Path) -> Turn:
+    turn = Turn("", None, "")
+    for line in session_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # a line cut short by a killed Pi
+        if not isinstance(ev, dict) or ev.get("type") != "message":
+            continue
+        msg = ev.get("message") or {}
+        if msg.get("role") == "user":
+            turn = Turn("", None, "")
+        elif msg.get("role") == "assistant":
+            turn.stop = msg.get("stopReason")
+            turn.error = msg.get("errorMessage") or ""
+            u = msg.get("usage")
+            if isinstance(u, dict):
+                turn.usage = u
+            text = _message_text(msg).strip()
+            if text:
+                turn.reply = text
+    return turn
+
+
+def _message_text(msg: Dict[str, Any]) -> str:
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    out = []
+    for part in content or []:
+        if isinstance(part, dict) and part.get("type") == "text":
+            out.append(part.get("text") or "")
+    return "".join(out)
+
+
+def tail_text(text: str, n: int = STDERR_TAIL_CHARS) -> str:
+    return text.strip()[-n:]
+
+
+# ---------------------------------------------------------------------------
+# Running Pi
+# ---------------------------------------------------------------------------
+
+# Pi stays in pier's process group (no start_new_session) and pier terminates
+# it on SIGTERM/SIGHUP/SIGINT, so a host that kills pier (e.g. a tool timeout)
+# never leaves an orphaned Pi burning tokens with nobody to read its reply.
+_children: List[subprocess.Popen] = []
+_children_lock = threading.RLock()
+_stopping = threading.Event()
+
+
+def _on_signal(signum: int, _frame: Any) -> None:
+    _stopping.set()
+    with _children_lock:
+        for p in _children:
+            if p.poll() is None:
+                p.terminate()
+    raise SystemExit(128 + signum)
+
+
+def run_pi(cwd: Path, argv: List[str]) -> Tuple[int, str]:
+    if _stopping.is_set():
+        raise PierError("pier is stopping")
+    try:
+        proc = subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise PierError(f"failed to start Pi: {exc}") from None
+    with _children_lock:
+        _children.append(proc)
+        if _stopping.is_set():
+            proc.terminate()
+    try:
+        _, err = proc.communicate()
+    finally:
+        with _children_lock:
+            _children.remove(proc)
+    return proc.returncode, err.decode("utf-8", errors="replace")
+
+
+@dataclass
+class Outcome:
+    reply: str  # printed on stdout when non-empty
+    error: Optional[str]  # None = success
+    code: int
+
+
+def turn_outcome(turn: Optional[Turn], code: int, err: str) -> Outcome:
+    """Judge a turn from the session file first: a provider error or abort is a
+    failure even when Pi exits 0, and earlier text in the turn is not the reply."""
+    exit_code = code if 0 < code < 256 else 1
+    if turn and turn.stop in FAILED_STOPS:
+        return Outcome("", f"model run {turn.stop}: {turn.error or tail_text(err) or 'no details'}",
+                       exit_code)
+    if turn and turn.stop == "length":
+        return Outcome(turn.reply, "reply cut off at the model's output token limit"
+                       " (continue it: pier send <ref> \"continue\")", exit_code)
+    if code != 0:
+        return Outcome("", f"pi exited {code}: {tail_text(err) or '(no stderr)'}", exit_code)
+    if not turn or not turn.reply:
+        return Outcome("", "no reply after the last prompt" + (f"; pi stderr: {tail_text(err)}"
+                                                               if tail_text(err) else ""), 1)
+    return Outcome(turn.reply, None, 0)
+
+
+def pi_argv(binary: str, home: Path, flags: List[str], session_args: List[str],
+            prompt: List[str]) -> List[str]:
+    return [binary, *flags, "--session-dir", str(sessions_dir(home)), *session_args, *prompt]
+
+
+def run_turn(home: Path, binary: str, sid: str, cwd: Path, flags: List[str],
+             session_args: List[str], prompt: str) -> Tuple[Outcome, Turn]:
+    with tempfile.TemporaryDirectory(prefix="pier-") as tmp:
+        argv = pi_argv(binary, home, flags, session_args,
+                       prompt_args(prompt, Path(tmp) / "prompt.md", write=True))
+        patch_sidecar(home, sid, pid=os.getpid())
+        try:
+            code, err = run_pi(cwd, argv)
+        finally:
+            patch_sidecar(home, sid, pid=None)
+    sfile = find_session_file(home, sid)
+    turn = last_turn(sfile) if sfile else Turn("", None, "")
+    return turn_outcome(turn, code, err), turn
+
+
+def patch_sidecar(home: Path, sid: str, **fields: Any) -> None:
+    """Update fields of a session's sidecar in place (drops keys set to None)."""
+    p = sidecar_path(home, sid)
+    if not p.is_file():
+        return  # a killed run between sidecar writes: nothing to patch
+    data = read_json(p)
+    for k, v in fields.items():
+        if v is None:
+            data.pop(k, None)
+        else:
+            data[k] = v
+    write_json(p, data)
+
+
+def summary_line(ref: str, out: Outcome, turn: Optional[Turn], name: Optional[str]) -> str:
+    """End-of-run stderr line: `pier: <ref> ok · N tok · $X` (or failed/...)."""
+    state = "ok" if out.error is None else "failed"
+    bits = [f"pier: {ref} {state}"]
+    if name:
+        bits[0] += f" ({name})"
+    if turn and turn.usage:
+        total = turn.usage.get("totalTokens")
+        if isinstance(total, (int, float)):
+            bits.append(f"{_fmt_tokens(int(total))} tok")
+        cost = (turn.usage.get("cost") or {}).get("total")
+        if isinstance(cost, (int, float)):
+            bits.append(f"${cost:.2f}")
+    line = " · ".join(bits)
+    if out.error:
+        line += f" — {out.error}"
+    return line
+
+
+def _fmt_tokens(n: int) -> str:
+    return f"{n // 1000}k" if n >= 1000 else str(n)
+
+
+def new_session(spec: RunSpec, home: Path, name: Optional[str]) -> Tuple[str, List[str]]:
+    """Mint a session id and persist its sidecar before Pi starts, so a killed
+    run can still be sent to or read back."""
+    flags = build_flags(spec)
+    sid = str(uuid.uuid4())
+    ensure_dir(sessions_dir(home))
+    write_json(sidecar_path(home, sid),
+               {"cwd": str(spec.cwd), "flags": flags, "name": name or spec.agent.name})
+    return sid, flags
+
+
+def print_dry_run(cwd: Path, notes: List[str], home: Path, flags: List[str],
+                  session_args: List[str], prompt: str) -> None:
+    for n in notes:
+        print(f"pier: note: {n}", file=sys.stderr)
+    binary = resolve_pi_binary(required=False)
+    placeholder = Path(tempfile.gettempdir()) / "pier-XXXX" / "prompt.md"
+    argv = pi_argv(binary, home, flags, session_args, prompt_args(prompt, placeholder, write=False))
+    print(f"cd {shlex.quote(str(cwd))} && {shlex.join(argv)}")
+
+
+def spill_path(home: Path, sid: str) -> Path:
+    return home / "out" / f"{sid}.md"
+
+
+def max_chars_or_default() -> int:
+    """--max-chars / PIER_MAX_CHARS budget, default 24k chars."""
+    raw = os.environ.get("PIER_MAX_CHARS")
+    return int(raw) if raw and raw.isdigit() else DEFAULT_MAX_CHARS
+
+
+def report(out: Outcome, home: Optional[Path] = None, sid: Optional[str] = None,
+           max_chars: Optional[int] = None) -> int:
+    """Print the reply within the output budget; an over-budget reply is spilled
+    to $PIER_HOME/out/<sid>.md and stdout ends with its path."""
+    if out.reply and max_chars is not None and len(out.reply) > max_chars:
+        ensure_dir(spill_path(home, sid).parent)
+        path = spill_path(home, sid)
+        path.write_text(out.reply, encoding="utf-8")
+        if max_chars > 0:
+            preview = out.reply[:PREVIEW_CHARS]
+            print(preview)
+            if not preview.endswith("\n"):
+                print()
+            print(f"[... {len(out.reply) - PREVIEW_CHARS} more chars; full reply: {path}]")
+        else:
+            print(f"full reply: {path}")
+    elif out.reply:
+        print(out.reply)
+    if out.error is None:
+        return 0
+    print(f"pier: error: {out.error}", file=sys.stderr)
+    return out.code
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _read_text(path: Path, what: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PierError(f"cannot read {what} {str(path)!r}: {exc}") from None
+
+
+def emit(obj: Any) -> None:
+    # Document itself has no trailing newline (TOON 4.4); print adds the line terminator.
+    print(encode_toon(obj))
+
+
+def read_task(words: List[str]) -> str:
+    """Task text: the words, or stdin when no words are given (heredoc/pipe)."""
+    task = " ".join(words) if words else sys.stdin.read()
+    task = task.strip()
+    if not task:
+        raise PierError("empty task (give task words, or pipe/heredoc stdin)")
+    return task
+
+
+def spec_from_args(args: argparse.Namespace) -> RunSpec:
+    cwd = Path(args.cwd).expanduser().resolve() if args.cwd else Path.cwd()
+    if not cwd.is_dir():
+        raise PierError(f"--cwd does not exist: {cwd}")
+    words = list(args.words)
+    if args.agent_file:
+        agent = load_agent_path(Path(args.agent_file).expanduser())
+    elif words:
+        agent = resolve_agent(words.pop(0), collect_agents(cwd))
+    else:
+        raise PierError("missing AGENT (or --agent-file)")
+    if args.no_tools and args.tools:
+        raise PierError("--no-tools conflicts with --tools")
+    return RunSpec(
+        cwd=cwd, task=read_task(words), agent=agent,
+        provider=args.provider, model=args.model, thinking=args.thinking,
+        tools="" if args.no_tools else args.tools, exclude_tools=args.exclude_tools,
+        extra=list(args.extra or []),
+    )
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    home = pier_home()
+    spec = resolve_spec(spec_from_args(args))
+    if args.dry_run:
+        print_dry_run(spec.cwd, spec.notes, home, build_flags(spec), ["--session-id", "<new-session-id>"],
+                      spec.task)
+        return 0
+    binary = resolve_pi_binary()
+    sid, flags = new_session(spec, home, args.name)
+    ref = sid_to_ref(sid)
+    wt: Optional[Dict[str, str]] = None
+    if getattr(args, "worktree", False):
+        wt = make_worktree(home, ref, spec.cwd)
+        spec.cwd = Path(wt["worktree"])
+        patch_sidecar(home, sid, worktree=wt["worktree"], start_head=wt["start_head"])
+    print(f"pier: {ref} started ({spec.agent.name})", file=sys.stderr, flush=True)
+    out, turn = run_turn(home, binary, sid, spec.cwd, flags, ["--session-id", sid], spec.task)
+    print(summary_line(ref, out, turn, spec.agent.name), file=sys.stderr)
+    code = report(out, home, sid, args.max_chars)
+    if wt:
+        cleanup_worktree(home, ref, wt)  # clean+HEAD unmoved: auto-removed; dirty: path on stderr
+    return code
+
+
+def make_worktree(home: Path, ref: str, cwd: Path) -> Dict[str, str]:
+    """`git worktree add --detach $PIER_HOME/worktrees/<ref>`; a HEAD snapshot,
+    without the caller's uncommitted changes (Claude Code isolation semantics)."""
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(cwd),
+                              capture_output=True, text=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PierError(f"--worktree: cannot inspect {cwd}: {exc}") from None
+    if not head:
+        raise PierError(f"--worktree: {cwd} is not a git repository")
+    wt = home / "worktrees" / ref
+    ensure_dir(wt.parent)
+    r = subprocess.run(["git", "worktree", "add", "--detach", str(wt), "HEAD"],
+                       cwd=str(cwd), capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise PierError(f"--worktree: git worktree add failed: {tail_text(r.stderr)}")
+    return {"worktree": str(wt), "start_head": head}
+
+
+def cleanup_worktree(home: Path, ref: str, wt: Dict[str, str]) -> None:
+    """Auto-remove a pristine worktree; keep a dirty one and print its path."""
+    path = wt["worktree"]
+    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=str(path),
+                           capture_output=True, text=True, timeout=30).stdout.strip()
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(path),
+                          capture_output=True, text=True, timeout=30).stdout.strip()
+    if dirty or head != wt["start_head"]:
+        print(f"pier: {ref} kept worktree (has changes): {path}", file=sys.stderr)
+        return
+    r = subprocess.run(["git", "worktree", "remove", str(path)],
+                       cwd=str(path), capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        print(f"pier: {ref} worktree remove failed: {tail_text(r.stderr)}", file=sys.stderr)
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    home = pier_home()
+    sid = resolve_ref(home, args.session)
+    side = load_sidecar(home, sid)
+    task = read_task(list(args.words))
+    sfile = find_session_file(home, sid)
+    if not sfile:
+        raise PierError(f"session {args.session} has no Pi session file under {sessions_dir(home)}")
+    session_args = ["--session", str(sfile)]
+    if args.dry_run:
+        print_dry_run(Path(side["cwd"]), [], home, side["flags"], session_args, task)
+        return 0
+    binary = resolve_pi_binary()
+    ref = sid_to_ref(sid)
+    out, turn = run_turn(home, binary, sid, Path(side["cwd"]), side["flags"], session_args, task)
+    print(summary_line(ref, out, turn, side.get("name")), file=sys.stderr)
+    return report(out, home, sid, args.max_chars)
+
+
+def cmd_result(args: argparse.Namespace) -> int:
+    home = pier_home()
+    sid = resolve_ref(home, args.session)
+    sfile = find_session_file(home, sid)
+    if not sfile:
+        raise PierError(f"unknown session {args.session!r} (searched {sessions_dir(home)})")
+    turn = last_turn(sfile)
+    out = turn_outcome(turn, 0, "")
+    ref = sid_to_ref(sid)
+    side = load_sidecar(home, sid)
+    print(summary_line(ref, out, turn, side.get("name")), file=sys.stderr)
+    return report(out, home, sid, args.max_chars)
+
+
+PS_LIMIT = 10
+
+
+def session_row(home: Path, sid: str, data: Dict[str, Any], mtime: float) -> Dict[str, Any]:
+    """One `ps` row: state from the sidecar pid + the session file's last turn."""
+    pid = data.get("pid")
+    sfile = find_session_file(home, sid)
+    turn = last_turn(sfile) if sfile else None
+    if isinstance(pid, int):
+        try:
+            os.kill(pid, 0)
+            state = "running"
+        except OSError:
+            state = "failed"  # pid recorded but no longer alive: a killed run
+    elif turn and turn.stop not in FAILED_STOPS and turn.reply:
+        state = "ok"
+    elif turn:
+        state = "failed"
+    else:
+        state = "new"
+    tok = ""
+    if turn and turn.usage:
+        total = turn.usage.get("totalTokens")
+        if isinstance(total, (int, float)):
+            tok = _fmt_tokens(int(total))
+    last = (turn.reply.splitlines()[-1] if turn and turn.reply else "")[:60]
+    return {"ref": sid_to_ref(sid), "agent": data.get("name") or "?", "state": state,
+            "age": _fmt_age(int(time.time() - mtime)), "tok": tok, "last": last}
+
+
+def _fmt_age(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h"
+
+
+def cmd_ps(args: argparse.Namespace) -> int:
+    home = pier_home()
+    if args.session:
+        sid = resolve_ref(home, args.session)
+        rows = [session_row(home, sid, load_sidecar(home, sid),
+                            sidecar_path(home, sid).stat().st_mtime)]
+    else:
+        cwd = str(Path(args.cwd or os.getcwd()).resolve())
+        rows = []
+        for sid, data, mtime in iter_sidecars(home):
+            if len(rows) >= PS_LIMIT:
+                break
+            if data.get("cwd") != cwd:
+                continue  # default view: this project's sessions only
+            rows.append(session_row(home, sid, data, mtime))
+    if not rows:
+        print("pier: no sessions (run one first)", file=sys.stderr)
+        return 0
+    emit({"sessions": rows})
+    return 0
+
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+
+def validate_agent_text(text: str, name_hint: Optional[str] = None) -> Dict[str, Any]:
+    errors: List[str] = []
+    warnings: List[str] = []
+    norm = text.replace("\r\n", "\n").lstrip("﻿")
+    fm, body = parse_frontmatter(text)
+    if not norm.startswith("---") or norm.find("\n---", 3) == -1:
+        errors.append("missing frontmatter block (--- ... ---)")
+    name = (fm.get("name") or name_hint or "").strip()
+    if not name:
+        errors.append("missing name (frontmatter name or file name)")
+    elif not NAME_RE.match(name):
+        errors.append(f"invalid name {name!r} (letters, digits, . _ -; max 64)")
+    if name_hint and fm.get("name") and fm["name"].strip() != name_hint:
+        errors.append(f"frontmatter name {fm['name'].strip()!r} != requested name {name_hint!r}")
+    if not body.strip():
+        errors.append("empty body (the body is the agent's role instructions)")
+    if not (fm.get("description") or "").strip():
+        warnings.append("missing description (recommended for selection)")
+    th = (fm.get("thinking") or "").strip().lower()
+    if th and th not in THINKING_LEVELS | {"false"}:
+        errors.append(f"thinking {th!r} not one of {sorted(THINKING_LEVELS)}")
+    fields = classify_fields(fm)
+    if fields["ignored"]:
+        warnings.append("ignored frontmatter (not mapped, no effect): " + ", ".join(fields["ignored"]))
+    for key in ("tools", "excludeTools"):
+        if key in fm:
+            filter_tool_list(parse_list(fm[key]) or [], key, warnings)
+    return {"ok": not errors, "name": name or None, "errors": errors, "warnings": warnings}
+
+
+def cmd_agents(args: argparse.Namespace) -> int:
+    cwd = Path(args.cwd).expanduser().resolve() if args.cwd else Path.cwd()
+    if args.agents_cmd == "paths":
+        emit({"order": "low -> high priority (later wins)",
+              "layers": [{"source": s, "path": str(p), "exists": p.is_dir()} for s, p in agent_layers(cwd)],
+              "new_project": str(project_agents_dir(cwd)), "new_user": str(user_agents_dir())})
+        return 0
+    if args.agents_cmd == "validate":
+        text = sys.stdin.read() if args.file == "-" else _read_text(Path(args.file).expanduser(), "agent file")
+        hint = None if args.file == "-" else Path(args.file).stem
+        if args.file != "-" and parse_frontmatter(text)[0].get("name"):
+            hint = None
+        rep = validate_agent_text(text, hint)
+        emit(rep)
+        return 0 if rep["ok"] else 1
+    if args.agents_cmd == "new":
+        if not NAME_RE.match(args.name):
+            raise PierError(f"invalid agent name {args.name!r}")
+        text = sys.stdin.read() if args.file == "-" else _read_text(Path(args.file).expanduser(), "definition file")
+        rep = validate_agent_text(text, args.name)
+        if not rep["ok"]:
+            emit(dict(rep, written=None))
+            return 1
+        if args.dir:
+            target_dir = Path(args.dir).expanduser()  # explicit, caller-chosen
+        elif args.user:
+            target_dir = user_agents_dir()
+        else:
+            target_dir = project_agents_dir(cwd)
+        target = target_dir.resolve() / f"{args.name}.md"
+        if target.exists() and not args.force:
+            raise PierError(f"{target} exists (use --force to overwrite)")
+        ensure_dir(target.parent)
+        target.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+        emit(dict(rep, written=str(target)))
+        return 0
+    agents = collect_agents(cwd)
+    if args.agents_cmd == "list":
+        emit([{"name": a.name, "description": a.description}
+              for a in sorted(agents.values(), key=lambda x: x.name)])
+        return 0
+    a = resolve_agent(args.name, agents)
+    print(a.path)
+    print()
+    print(_read_text(a.path, "agent file").rstrip())
+    return 0
+
+
+def add_task_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the exact Pi command; runs nothing, writes nothing")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="pier", description="Run named Pi subagents from agent Markdown files. "
+                                "Every run is synchronous and prints only the reply on stdout.")
+    p.add_argument("--version", action="version", version=f"pier {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    sp = sub.add_parser("run", help="start a new Pi session and print its reply",
+                        description="Start a new Pi session, wait for it, print the reply. "
+                        "stderr: 'pier: <ref> started (<agent>)' then 'pier: <ref> ok · ...'.")
+    sp.add_argument("words", nargs="*", metavar="AGENT TASK",
+                    help="agent name, then the task as words; with --agent-file every word is task")
+    sp.add_argument("--agent-file", metavar="PATH", help="use this agent .md instead of AGENT "
+                    "(frontmatter optional: a plain text file is just a role)")
+    add_task_args(sp)
+    sp.add_argument("--cwd", metavar="DIR",
+                    help="Pi working directory and project agent lookup root (default: current)")
+    sp.add_argument("--provider", help="Pi --provider (requires --model)")
+    sp.add_argument("--model", metavar="PROVIDER/ID", help="Pi --model; overrides frontmatter")
+    sp.add_argument("--thinking", metavar="LEVEL", help="Pi --thinking (off|minimal|low|medium|high|xhigh|max)")
+    sp.add_argument("--tools", metavar="CSV", help="Pi --tools allowlist; overrides frontmatter")
+    sp.add_argument("--no-tools", action="store_true", help="Pi --no-tools")
+    sp.add_argument("--exclude-tools", metavar="CSV", help="Pi --exclude-tools")
+    sp.add_argument("--name", metavar="HANDLE",
+                    help="session handle for send/result/ps (default: the agent name)")
+    sp.add_argument("--max-chars", type=int, default=max_chars_or_default(), metavar="N",
+                    help=f"stdout char budget for the reply; 0 = print only the spill path "
+                         f"(env PIER_MAX_CHARS; default {DEFAULT_MAX_CHARS})")
+    sp.add_argument("--worktree", action="store_true",
+                    help="run Pi in a git worktree of HEAD (snapshot, no uncommitted changes); "
+                         "clean at exit -> auto-removed, dirty -> kept and its path printed")
+    sp.add_argument("--extra", nargs=argparse.REMAINDER, default=[], metavar="PI_ARG",
+                    help="raw Pi args, passed through (must be last)")
+
+    sp = sub.add_parser("send", help="send a follow-up to an existing session",
+                        description="Continue a session with the same agent setup (system prompt, tools, "
+                        "skills, extensions) as its first run, and print the reply.")
+    sp.add_argument("session", metavar="SESSION",
+                    help="session: 8-char ref, --name handle, or full uuid from run")
+    sp.add_argument("words", nargs="*", metavar="TASK",
+                    help="follow-up message as words; with no words, read stdin (heredoc/pipe)")
+    add_task_args(sp)
+    sp.add_argument("--max-chars", type=int, default=max_chars_or_default(), metavar="N",
+                    help=f"stdout char budget for the reply; 0 = print only the spill path "
+                         f"(env PIER_MAX_CHARS; default {DEFAULT_MAX_CHARS})")
+
+    sp = sub.add_parser("result", help="print a session's last reply",
+                        description="Print the reply of a session's last turn; fails if that turn has none.")
+    sp.add_argument("session", metavar="SESSION",
+                    help="session: 8-char ref, --name handle, or full uuid from run")
+    sp.add_argument("--max-chars", type=int, default=max_chars_or_default(), metavar="N",
+                    help=f"stdout char budget for the reply; 0 = print only the spill path "
+                         f"(env PIER_MAX_CHARS; default {DEFAULT_MAX_CHARS})")
+
+    sp = sub.add_parser("ps", help="list recent sessions (TOON)",
+                        description="Sessions of this project (10 most recent, TOON): "
+                                    "{ref, agent, state, age, tok, last}. With REF, that session only.")
+    sp.add_argument("session", nargs="?", metavar="REF",
+                    help="8-char ref or --name handle; omit for this project's sessions")
+    sp.add_argument("--cwd", metavar="DIR", help="project root to list sessions of (default: current)")
+
+    ap = sub.add_parser("agents", help="list, inspect, validate or save agent files")
+    asub = ap.add_subparsers(dest="agents_cmd", required=True, metavar="ACTION")
+    helps = {"list": "name + description of every agent (TOON)",
+             "show": "print an agent's path and file",
+             "paths": "agent lookup directories, low -> high priority",
+             "validate": "check an agent .md; exit 1 on errors",
+             "new": "validate and save an agent .md"}
+    for n, h in helps.items():
+        x = asub.add_parser(n, help=h, description=h)
+        if n == "show":
+            x.add_argument("name", metavar="NAME", help="agent name")
+        if n == "validate":
+            x.add_argument("file", metavar="PATH", help="agent .md ('-' = stdin)")
+        if n == "new":
+            x.add_argument("name", metavar="NAME", help="agent name; must match frontmatter name if set")
+            x.add_argument("--file", required=True, metavar="PATH", help="definition .md ('-' = stdin)")
+            w = x.add_mutually_exclusive_group()
+            w.add_argument("--user", action="store_true",
+                           help="save to $PIER_HOME/agents instead of <cwd>/.pier/agents")
+            w.add_argument("--dir", metavar="DIR", help="save to this directory (only one you were told to use)")
+            x.add_argument("--force", action="store_true", help="overwrite an existing file")
+        x.add_argument("--cwd", metavar="DIR", help="project root for <cwd>/.pier/agents (default: current)")
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, _on_signal)
+    try:
+        return {"run": cmd_run, "send": cmd_send, "result": cmd_result,
+                "ps": cmd_ps, "agents": cmd_agents}[args.cmd](args)
+    except PierError as exc:
+        print(f"pier: error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -6,10 +6,13 @@ Pi binary with an empty HOME and --offline (no credentials -> no model call).
 """
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import json
 import os
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -18,16 +21,16 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PIER = ROOT / "scripts" / "pier.py"
-WRAPPER = ROOT / "scripts" / "pier"
+PIER = ROOT / "scripts" / "pier"
 MOCK = ROOT / "mock" / "mock_pi"
 
 
 def load_mod():
-    spec = importlib.util.spec_from_file_location("pier_mod", PIER)
+    loader = importlib.machinery.SourceFileLoader("pier_mod", str(PIER))
+    spec = importlib.util.spec_from_loader("pier_mod", loader)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["pier_mod"] = mod
-    spec.loader.exec_module(mod)
+    loader.exec_module(mod)
     return mod
 
 
@@ -42,39 +45,42 @@ class Base(unittest.TestCase):
         self.rec_dir = self.tmp / "calls"
         self.env = {
             "PI_BIN": str(MOCK), "HOME": str(self.home), "MOCK_PI_RECORD": str(self.rec),
-            "MOCK_PI_RECORD_DIR": str(self.rec_dir), "PIER_QUIET": "",
+            "MOCK_PI_RECORD_DIR": str(self.rec_dir),
         }
-        for k in ("PIER_HOME", "PIER_AGENT_DIRS", "PIER_USER_AGENTS_DIR",
-                  "MOCK_PI_FAIL", "MOCK_PI_FAIL_ON", "MOCK_PI_SLEEP", "MOCK_PI_SLEEP_ON", "MOCK_PI_REPLY"):
+        for k in ("PIER_HOME", "PIER_AGENT_DIRS", "MOCK_PI_FAIL", "MOCK_PI_FAIL_ON",
+                  "MOCK_PI_SLEEP", "MOCK_PI_SLEEP_ON", "MOCK_PI_REPLY"):
             self.env[k] = ""
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def pier(self, *args, env=None, input_text=None, cwd=None, json_out=True):
+    def full_env(self, env=None):
         e = {k: v for k, v in os.environ.items()}
         e.update(self.env)
         e = {k: v for k, v in e.items() if v != ""}
         if env:
             e.update(env)
-        argv = list(args)
-        # Existing JSON parsers: inject --json unless caller opted out or already set.
-        # Insert before --extra (REMAINDER) so it is not swallowed into Pi passthrough.
-        if json_out and "--json" not in argv and "--help" not in argv and "--version" not in argv:
-            if "--extra" in argv:
-                i = argv.index("--extra")
-                argv.insert(i, "--json")
-            else:
-                argv.append("--json")
-        return subprocess.run([sys.executable, str(PIER), *argv], cwd=str(cwd or self.proj), env=e,
-                              input=input_text, stdin=None if input_text is not None else subprocess.DEVNULL,
+        return e
+
+    def pier(self, *args, env=None, input_text=None, cwd=None):
+        return subprocess.run([sys.executable, str(PIER), *args], cwd=str(cwd or self.proj),
+                              env=self.full_env(env), input=input_text,
+                              stdin=None if input_text is not None else subprocess.DEVNULL,
                               text=True, capture_output=True, timeout=60)
 
-    def j(self, r):
-        try:
-            return json.loads(r.stdout)
-        except json.JSONDecodeError:
-            self.fail(f"not JSON (rc={r.returncode}): {r.stdout!r} / {r.stderr!r}")
+    def dry(self, *args, **kw):
+        """Run with --dry-run and return the Pi argv parsed from `cd DIR && pi ...`."""
+        args = list(args)
+        if "--extra" in args:
+            args.insert(args.index("--extra"), "--dry-run")
+        else:
+            args.append("--dry-run")
+        r = self.pier(*args, **kw)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        tokens = shlex.split(r.stdout)
+        self.assertEqual(tokens[0], "cd")
+        self.assertEqual(tokens[2], "&&")
+        return tokens[3:]
 
     def argv(self):
         return json.loads(self.rec.read_text())
@@ -82,11 +88,37 @@ class Base(unittest.TestCase):
     def calls(self):
         return [json.loads(p.read_text()) for p in sorted(self.rec_dir.glob("*.json"))] if self.rec_dir.exists() else []
 
+    def state(self):
+        return self.home / ".pier"
+
+    def sid_of(self, r, home=None):
+        """Full sid from the run's stderr; the 8-char ref is `ref_of`."""
+        sessions = (home or self.state()) / "sessions"
+        first = r.stderr.splitlines()[0]
+        self.assertTrue(first.startswith("pier: "), r.stderr)
+        cand = sessions / f"{first.split()[1]}.pier.json"
+        if cand.is_file():
+            return cand.name[:-len(".pier.json")]
+        hits = sorted(sessions.glob(f"{first.split()[1]}*.pier.json"))
+        self.assertEqual(len(hits), 1, r.stderr)  # the 8-char ref is unique
+        return hits[0].name[:-len(".pier.json")]
+
+    def ref_of(self, r):
+        first = r.stderr.splitlines()[0]
+        self.assertTrue(first.startswith("pier: "), r.stderr)
+        ref = first.split()[1]
+        self.assertEqual(len(ref), 8)
+        return ref
+
     def write_agent(self, rel, text):
         p = self.proj / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
         return p
+
+
+def flag(argv, name):
+    return argv[argv.index(name) + 1]
 
 
 class FrontmatterTests(unittest.TestCase):
@@ -108,28 +140,61 @@ class FrontmatterTests(unittest.TestCase):
         c = self.mod.classify_fields({"name": "a", "model": "m", "description": "d", "async": "true",
                                       "systemPromptMode": "replace", "launcher": "x", "weird": "1"})
         self.assertEqual(c["mapped"], ["name", "model", "systemPromptMode"])
-        self.assertIn("async", c["meta"])
-        self.assertEqual(c["ignored"], ["launcher", "weird"])
+        self.assertEqual(c["meta"], ["description"])
+        self.assertEqual(c["ignored"], ["async", "launcher", "weird"])
 
-    def test_no_strict_or_allow_flags(self):
-        src = PIER.read_text()
-        self.assertNotIn("--strict-frontmatter", src)
-        self.assertNotIn("allow-unsupported", src)
+
+class LastTurnTests(unittest.TestCase):
+    def setUp(self):
+        self.mod = load_mod()
+        self.tmp = Path(tempfile.mkdtemp(prefix="pier-reply-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def session(self, *messages, trailer=""):
+        p = self.tmp / "s.jsonl"
+        lines = [json.dumps({"type": "session", "id": "x"})]
+        lines += [json.dumps({"type": "message", "message": m}) for m in messages]
+        p.write_text("\n".join(lines) + "\n" + trailer, encoding="utf-8")
+        return p
+
+    def test_reply_is_last_assistant_text_of_last_turn(self):
+        def text(role, t):
+            return {"role": role, "content": [{"type": "text", "text": t}]}
+        p = self.session(
+            text("user", "q1"), text("assistant", "a1"),
+            text("user", "q2"),
+            {"role": "assistant", "content": [{"type": "toolCall", "name": "read"}]},
+            {"role": "toolResult", "content": [{"type": "text", "text": "file body"}]},
+            text("assistant", "a2 final"),
+            trailer='{"type":"message","mess',  # line cut short by a killed Pi
+        )
+        t = self.mod.last_turn(p)
+        self.assertEqual((t.reply, t.stop), ("a2 final", None))
+
+    def test_unanswered_turn_has_no_reply(self):
+        p = self.session({"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"},
+                         {"role": "user", "content": "q2"})
+        self.assertEqual(self.mod.last_turn(p).reply, "")
+
+    def test_failed_stop_reason_beats_exit_zero_and_earlier_text(self):
+        # JSON-mode Pi exits 0 on provider errors; the session entry is authoritative.
+        t = self.mod.Turn("let me look", "error", "529 overloaded")
+        out = self.mod.turn_outcome(t, 0, "")
+        self.assertEqual(out.reply, "")
+        self.assertIn("529 overloaded", out.error)
+        self.assertEqual(out.code, 1)
 
 
 class DiscoveryTests(Base):
     def test_lookup_order_project_pier_agents_wins(self):
         self.write_agent(".pier/agents/reviewer.md", "---\nname: reviewer\ndescription: p\n---\nPROJECT BODY\n")
-        (self.home / ".pier" / "agents").mkdir(parents=True)
-        (self.home / ".pier" / "agents" / "reviewer.md").write_text("---\nname: reviewer\n---\nUSER BODY\n")
-        d = self.j(self.pier("run", "reviewer", "t", "--dry-run"))
-        a = d["argv"]
-        self.assertEqual(a[a.index("--system-prompt") + 1], "PROJECT BODY")
-        self.assertEqual(d["prompt"], "## Task\n\nt\n")
+        (self.state() / "agents").mkdir(parents=True)
+        (self.state() / "agents" / "reviewer.md").write_text("---\nname: reviewer\n---\nUSER BODY\n")
+        self.assertEqual(flag(self.dry("run", "reviewer", "t"), "--system-prompt"), "PROJECT BODY")
         shutil.rmtree(self.proj / ".pier" / "agents")
-        d = self.j(self.pier("run", "reviewer", "t", "--dry-run"))
-        a = d["argv"]
-        self.assertEqual(a[a.index("--system-prompt") + 1], "USER BODY")
+        self.assertEqual(flag(self.dry("run", "reviewer", "t"), "--system-prompt"), "USER BODY")
 
     def test_pi_dirs_never_read(self):
         self.write_agent(".pi/agents/scout.md", "---\nname: scout\n---\nSCOUT\n")
@@ -137,28 +202,30 @@ class DiscoveryTests(Base):
         r = self.pier("run", "scout", "t", "--dry-run")
         self.assertEqual(r.returncode, 2)
         self.assertIn("unknown agent", r.stderr)
-        # flag gone
-        r = self.pier("run", "--help")
-        self.assertNotIn("include-pi-subagents", r.stdout + r.stderr)
+
+    def test_unknown_agent_lists_available(self):
+        r = self.pier("run", "nope", "t")
+        self.assertEqual(r.returncode, 2)
+        for n in ("explorer", "planner", "reviewer", "worker"):
+            self.assertIn(n, r.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_paths_command(self):
-        d = self.j(self.pier("agents", "paths"))
-        srcs = [l["source"] for l in d["layers"]]
-        self.assertEqual(srcs[0], "skill")
-        self.assertEqual(srcs[-2:], ["user", "project"])
-        self.assertNotIn("pi-subagents", srcs)
-        self.assertTrue(d["new_default"].endswith(os.path.join(".pier", "agents")))
+        out = self.pier("agents", "paths").stdout
+        rows = [l.split(",")[0].strip() for l in out.splitlines() if l.startswith("  ")]
+        self.assertEqual(rows, ["skill", "user", "project"])
+        self.assertIn(str((self.state() / "agents").resolve()), out)
 
-    def test_list_name_description_only(self):
-        rows = self.j(self.pier("agents", "list"))
-        names = [a["name"] for a in rows]
-        for n in ("explorer", "planner", "reviewer", "worker"):
-            self.assertIn(n, names)
-        for a in rows:
-            self.assertEqual(set(a.keys()), {"name", "description"})
-        # aliases no longer resolve
-        r = self.pier("run", "pr-reviewer", "t", "--dry-run")
-        self.assertEqual(r.returncode, 2)
+    def test_list_is_toon_table(self):
+        r = self.pier("agents", "list")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(r.stdout.startswith("[4]{name,description}:"), r.stdout)
+        self.assertIn("\n  reviewer,", r.stdout)
+
+    def test_show_prints_path_and_file(self):
+        r = self.pier("agents", "show", "reviewer")
+        self.assertEqual(r.stdout.splitlines()[0], str(ROOT / "agents" / "reviewer.md"))
+        self.assertIn("You are a rigorous code reviewer.", r.stdout)
 
 
 class MappingTests(Base):
@@ -166,141 +233,107 @@ class MappingTests(Base):
         self.write_agent(".pier/agents/m.md",
                          "---\nname: m\nmodel: anthropic/claude-x\nthinking: high\ntools: read, bash\n"
                          "excludeTools: write\ndefaultProvider: openai\n---\nBODY\n")
-        d = self.j(self.pier("run", "m", "go", "--dry-run"))
-        a = d["argv"]
+        a = self.dry("run", "m", "go")
         self.assertEqual(a[0], str(MOCK))
-        self.assertEqual(a[1:3], ["--mode", "json"])
+        self.assertEqual(a[1], "--print")
         self.assertNotIn("--provider", a)  # model already has provider/
-        self.assertEqual(a[a.index("--model") + 1], "anthropic/claude-x")
-        self.assertEqual(a[a.index("--thinking") + 1], "high")
-        self.assertEqual(a[a.index("--tools") + 1], "read,bash")
-        self.assertEqual(a[a.index("--exclude-tools") + 1], "write")
-        self.assertEqual(a[a.index("--name") + 1], "m")
-        self.assertIn("--session-dir", a)
+        self.assertEqual(flag(a, "--model"), "anthropic/claude-x")
+        self.assertEqual(flag(a, "--thinking"), "high")
+        self.assertEqual(flag(a, "--tools"), "read,bash")
+        self.assertEqual(flag(a, "--exclude-tools"), "write")
+        self.assertEqual(flag(a, "--name"), "m")
+        self.assertEqual(Path(flag(a, "--session-dir")).resolve(), (self.state() / "sessions").resolve())
         self.assertIn("--session-id", a)
-        self.assertEqual(a[-2], "--")
-        self.assertFalse((self.proj / ".pier" / "jobs").exists() and any((self.proj / ".pier" / "jobs").iterdir()))
-        self.assertFalse(self.rec.exists())  # dry-run never runs pi
+        self.assertEqual(a[-2:], ["--", "go"])
+        self.assertFalse(self.state().exists())  # dry-run writes nothing
+        self.assertFalse(self.rec.exists())  # and never runs pi
 
     def test_default_provider_and_suffix(self):
         self.write_agent(".pier/agents/p.md", "---\nname: p\nmodel: gpt-x:low\nthinking: high\ndefaultProvider: openai\n---\nB\n")
-        a = self.j(self.pier("run", "p", "go", "--dry-run"))["argv"]
-        self.assertEqual(a[a.index("--provider") + 1], "openai")
-        self.assertEqual(a[a.index("--model") + 1], "gpt-x:low")
+        a = self.dry("run", "p", "go")
+        self.assertEqual(flag(a, "--provider"), "openai")
+        self.assertEqual(flag(a, "--model"), "gpt-x:low")
         self.assertNotIn("--thinking", a)  # suffix wins over frontmatter thinking
-        a = self.j(self.pier("run", "p", "go", "--dry-run", "--thinking", "max"))["argv"]
-        self.assertEqual(a[a.index("--thinking") + 1], "max")  # explicit CLI always emitted
+        self.assertEqual(flag(self.dry("run", "p", "go", "--thinking", "max"), "--thinking"), "max")
 
     def test_cli_overrides(self):
-        a = self.j(self.pier("run", "reviewer", "x", "--dry-run", "--model", "zai/glm", "--tools", "read",
-                             "--name", "N", "--mode", "print"))["argv"]
-        self.assertEqual(a[a.index("--tools") + 1], "read")
-        self.assertEqual(a[a.index("--name") + 1], "N")
-        self.assertIn("--print", a)
+        a = self.dry("run", "reviewer", "x", "--model", "zai/glm", "--tools", "read")
+        self.assertEqual(flag(a, "--tools"), "read")
+        self.assertEqual(flag(a, "--model"), "zai/glm")
+        self.assertIn("--no-tools", self.dry("run", "reviewer", "x", "--no-tools"))
+        r = self.pier("run", "reviewer", "x", "--no-tools", "--tools", "read")
+        self.assertEqual(r.returncode, 2)
 
-    def test_empty_tools_no_tools(self):
-        self.write_agent(".pier/agents/e.md", "---\nname: e\ntools: contact_supervisor, mcp:x/y\n---\nB\n")
+    def test_non_native_tools_dropped_with_note(self):
+        self.write_agent(".pier/agents/e.md", "---\nname: e\ntools: contact_supervisor, mcp:x/y\nlauncher: tmux\n---\nB\n")
         r = self.pier("run", "e", "go", "--dry-run")
-        d = self.j(r)
-        self.assertIn("--no-tools", d["argv"])
-        self.assertIn("contact_supervisor", r.stderr)  # dropped, but not silently
-        self.assertIn("no effect", r.stderr)
-        self.assertTrue(any("contact_supervisor" in n for n in d["notes"]))
+        self.assertIn("--no-tools", shlex.split(r.stdout))
+        self.assertIn("contact_supervisor", r.stderr)
+        self.assertIn("launcher", r.stderr)
+        r = self.pier("run", "e", "go")
+        lines = r.stderr.splitlines()
+        self.assertTrue(lines[1].startswith("pier: ") and " ok (e)" in lines[1], r.stderr)
 
-    def test_ignored_fields_simple_notice(self):
-        self.write_agent(".pier/agents/x.md", "---\nname: x\nsystemPromptMode: replace\nasync: true\nlauncher: tmux\n---\nB\n")
-        r = self.pier("run", "x", "go", "--dry-run")
-        d = self.j(r)
-        self.assertEqual(d["ignored_fields"], ["launcher"])
-        self.assertIn("not mapped, no effect", r.stderr)
-        self.assertIn("--system-prompt", d["argv"])
-        self.assertEqual(d["argv"][d["argv"].index("--system-prompt") + 1], "B")
-        self.assertNotIn("async", r.stderr)  # async is metadata, not mapped, no warning
-        r = self.pier("run", "x", "go", "--dry-run", env={"PIER_QUIET": "1"})
-        self.assertEqual(r.stderr, "")
-
-    def test_exact_prompt_composition(self):
+    def test_prompt_is_task_and_body_is_system_prompt(self):
         self.write_agent(".pier/agents/c.md", "---\nname: c\n---\n\nROLE LINE\n\nSecond para.\n\n")
-        (self.proj / "h.md").write_text("HANDOFF\n")
-        d = self.j(self.pier("run", "c", "DO THE THING", "--dry-run"))
-        self.assertEqual(d["prompt"], "## Task\n\nDO THE THING\n")
-        self.assertEqual(d["argv"][d["argv"].index("--system-prompt") + 1], "ROLE LINE\n\nSecond para.")
-        d = self.j(self.pier("run", "c", "T", "--handoff-file", "h.md", "--dry-run"))
-        self.assertEqual(d["prompt"], "## Context handoff\n\nHANDOFF\n\n## Task\n\nT\n")
-        d = self.j(self.pier("run", "c", "T", "--no-agent-body", "--dry-run"))
-        self.assertEqual(d["prompt"], "## Task\n\nT\n")
-        self.assertNotIn("--system-prompt", d["argv"])
-        self.assertNotIn("--append-system-prompt", d["argv"])
+        a = self.dry("run", "c", "DO THE THING")
+        self.assertEqual(a[-1], "DO THE THING")
+        self.assertEqual(flag(a, "--system-prompt"), "ROLE LINE\n\nSecond para.")
 
-    def test_resolved_show(self):
-        d = self.j(self.pier("agents", "show", "reviewer", "--resolved"))
-        fields = [m["field"] for m in d["mapping"]]
-        for f in ("name", "tools", "excludeTools", "thinking", "(body)", "task", "effective"):
-            self.assertIn(f, fields)
-        self.assertIn("argv_shell", d)
-
-    def test_argv_shell_quoting_unicode(self):
+    def test_quoting_unicode_roundtrip(self):
         task = "it's \"quoted\" $HOME `x` 中文 ✓"
-        d = self.j(self.pier("run", "reviewer", task, "--dry-run", "--extra", "--api-key", "SECRET"))
-        self.assertNotIn("SECRET", d["argv_shell"])
-        self.assertIn("<redacted>", d["argv_shell"])
-        import shlex
-        parsed = shlex.split(d["argv_shell"])
-        self.assertEqual(parsed[-1], d["prompt"])
-        self.assertIn(task, d["prompt"])
+        self.assertEqual(self.dry("run", "reviewer", task)[-1], task)
 
-    def test_large_prompt_uses_file_transport(self):
+    def test_api_key_in_extra_rejected(self):
+        r = self.pier("run", "reviewer", "x", "--extra", "--api-key", "SECRET")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("environment", r.stderr)
+        self.assertNotIn("SECRET", r.stderr)
+        self.assertFalse(self.state().exists())
+
+    def test_large_prompt_uses_temp_file(self):
+        # large tasks go through a temp @file: feed the big text via stdin
         big = "x" * 120_000
-        (self.proj / "big.txt").write_text(big)
-        d = self.j(self.pier("run", "reviewer", "--file", "big.txt", "--dry-run"))
-        self.assertEqual(d["prompt_transport"], "file")
-        self.assertTrue(d["argv"][-1].startswith("@"))
-        r = self.pier("run", "reviewer", "--file", "big.txt")
+        r = self.pier("run", "reviewer", input_text=big)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue(self.argv()[-1].startswith("@"))
-        self.assertIn("xxxx", self.j(r)["result_preview"])
+        at = self.argv()[-1]
+        self.assertTrue(at.startswith("@"))
+        self.assertIn("xxxx", r.stdout)
+        self.assertFalse(Path(at[1:]).exists())  # cleaned up after Pi exits
 
 
 class InputModesTests(Base):
-    def test_task_file_and_stdin(self):
-        (self.proj / "task file.md").write_text("LONG TASK 中文\n")
-        r = self.pier("run", "reviewer", "--file", "task file.md")
+    def test_task_stdin_when_no_words(self):
+        r = self.pier("run", "reviewer", input_text="LONG TASK 中文\n")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("LONG TASK 中文", self.argv()[-1])
-        r = self.pier("run", "reviewer", "--file", "-", input_text="FROM STDIN\n")
-        self.assertIn("FROM STDIN", self.argv()[-1])
-        r = self.pier("run", "reviewer", input_text="IMPLICIT STDIN\n")
-        self.assertIn("IMPLICIT STDIN", self.argv()[-1])
-        r = self.pier("run", "reviewer", "--task-file", "task file.md", "--dry-run")
-        self.assertIn("LONG TASK", self.j(r)["prompt"])
+        self.assertEqual(self.argv()[-1], "LONG TASK 中文")
+
+    def test_words_beat_stdin(self):
+        r = self.pier("run", "reviewer", "WORDS", input_text="leak")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.argv()[-1], "WORDS")
+
+    def test_empty_stdin_rejected(self):
+        r = self.pier("run", "reviewer", input_text="  \n")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("empty task", r.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_agent_file_direct(self):
         p = self.tmp / "tmp agent.md"
         p.write_text("---\nname: adhoc\ntools: read\n---\nADHOC ROLE\n")
-        d = self.j(self.pier("run", "--agent-file", str(p), "do", "it", "--dry-run"))
-        self.assertEqual(d["agent"], "adhoc")
-        self.assertEqual(d["argv"][d["argv"].index("--system-prompt") + 1], "ADHOC ROLE")
-        self.assertEqual(d["prompt"], "## Task\n\ndo it\n")
-        r = self.pier("run", "--agent-file", str(p), "--agent", "reviewer", "x", "--dry-run")
-        self.assertEqual(r.returncode, 2)
+        a = self.dry("run", "--agent-file", str(p), "do", "it")
+        self.assertEqual(flag(a, "--system-prompt"), "ADHOC ROLE")
+        self.assertEqual(flag(a, "--name"), "adhoc")
+        self.assertEqual(a[-1], "do it")
+        (self.tmp / "role.txt").write_text("FILE ROLE\n")  # no frontmatter: just a role
+        a = self.dry("run", "--agent-file", str(self.tmp / "role.txt"), "t")
+        self.assertEqual(flag(a, "--system-prompt"), "FILE ROLE")
+        self.assertEqual(flag(a, "--name"), "role")
 
-    def test_custom_mode_without_agent(self):
-        d = self.j(self.pier("run", "--instructions", "You are terse.", "summarise", "--model", "m1",
-                             "--tools", "read,grep", "--dry-run"))
-        self.assertIsNone(d["agent"])
-        self.assertEqual(d["prompt"], "## Task\n\nsummarise\n")
-        self.assertEqual(d["argv"][d["argv"].index("--system-prompt") + 1], "You are terse.")
-        self.assertNotIn("--name", d["argv"])
-        d = self.j(self.pier("run", "reviewer", "x", "--role", "OVERRIDE", "--dry-run"))
-        self.assertEqual(d["argv"][d["argv"].index("--system-prompt") + 1], "OVERRIDE")
-        self.assertNotIn("rigorous code reviewer", d["prompt"])
-        self.assertNotIn("rigorous code reviewer", " ".join(d["argv"]))
-        r = self.pier("run", "--no-agent", "x", "--dry-run")
-        self.assertEqual(r.returncode, 2)
-
-    def test_wrapper_runs_without_bin_on_path(self):
-        r = subprocess.run([str(WRAPPER), "--version"], capture_output=True, text=True)
-        self.assertIn("pier", r.stdout)
+    def test_executable_runs_directly(self):
+        r = subprocess.run([str(PIER), "--version"], capture_output=True, text=True)
+        self.assertIn("pier 0.1.0", r.stdout)
 
 
 class AgentAuthoringTests(Base):
@@ -309,29 +342,27 @@ class AgentAuthoringTests(Base):
     def test_validate(self):
         p = self.tmp / "sql-reviewer.md"
         p.write_text(self.GOOD)
-        d = self.j(self.pier("agents", "validate", str(p)))
-        self.assertTrue(d["ok"])
+        r = self.pier("agents", "validate", str(p))
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("ok: true", r.stdout)
         p.write_text("---\nname: bad name\nthinking: ultra\nlauncher: x\n---\n")
         r = self.pier("agents", "validate", str(p))
         self.assertEqual(r.returncode, 1)
-        d = self.j(r)
-        self.assertEqual(len(d["errors"]), 3)
-        self.assertTrue(any("no effect" in w for w in d["warnings"]))
+        self.assertIn("errors[3]:", r.stdout)
+        self.assertIn("no effect", r.stdout)
 
     def test_new_default_project_path(self):
         p = self.tmp / "def.md"
         p.write_text(self.GOOD)
-        d = self.j(self.pier("agents", "new", "sql-reviewer", "--file", str(p)))
-        target = self.proj / ".pier" / "agents" / "sql-reviewer.md"
-        self.assertEqual(Path(d["written"]), target.resolve())
+        r = self.pier("agents", "new", "sql-reviewer", "--file", str(p))
+        target = (self.proj / ".pier" / "agents" / "sql-reviewer.md").resolve()
+        self.assertIn(f"written: {target}", r.stdout)
         self.assertTrue(target.exists())
         r = self.pier("agents", "new", "sql-reviewer", "--file", str(p))
         self.assertEqual(r.returncode, 2)  # no silent overwrite
         self.assertIn("--force", r.stderr)
-        d = self.j(self.pier("run", "sql-reviewer", "t", "--dry-run"))
-        self.assertEqual(d["agent_path"], str(target.resolve()))
-        d = self.j(self.pier("agents", "new", "sql-reviewer", "--file", "-", "--user", input_text=self.GOOD))
-        self.assertEqual(Path(d["written"]), (self.home / ".pier" / "agents" / "sql-reviewer.md").resolve())
+        r = self.pier("agents", "new", "sql-reviewer", "--file", "-", "--user", input_text=self.GOOD)
+        self.assertTrue((self.state() / "agents" / "sql-reviewer.md").exists(), r.stderr)
 
     def test_new_never_touches_pi_or_skill_dirs(self):
         p = self.tmp / "def.md"
@@ -344,309 +375,328 @@ class AgentAuthoringTests(Base):
         self.assertFalse((self.proj / ".agents").exists())
         self.assertEqual(before, sorted(x.name for x in (ROOT / "agents").iterdir()))
 
-    def test_new_rejects_invalid_and_name_mismatch(self):
+    def test_new_rejects_name_mismatch(self):
         p = self.tmp / "def.md"
         p.write_text(self.GOOD)
         r = self.pier("agents", "new", "other", "--file", str(p))
         self.assertEqual(r.returncode, 1)
         self.assertFalse((self.proj / ".pier" / "agents" / "other.md").exists())
 
-    def test_skill_documents_boundary(self):
-        skill = (ROOT / "SKILL.md").read_text()
-        self.assertIn("references/agent-authoring.md", skill)
-        self.assertIn(".pier/agents", skill)
-        self.assertIn("PIER_HOME", skill)
-        self.assertIn("--system-prompt", skill)
-        self.assertTrue((ROOT / "references" / "agent-authoring.md").exists())
-        readme = (ROOT / "README.md").read_text()
-        self.assertIn("不会污染 Pi", readme)
-        self.assertIn("`~/.pier/`", readme)
-        self.assertIn("0.3.0", readme)
 
+class SessionTests(Base):
+    def test_run_prints_reply_and_session(self):
+        r = self.pier("run", "reviewer", "hello")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "mock-ok: hello\n")
+        sid = self.sid_of(r)
+        side = json.loads((self.state() / "sessions" / f"{sid}.pier.json").read_text())
+        self.assertEqual(side["cwd"], str(self.proj.resolve()))
+        self.assertIn("--system-prompt", side["flags"])
+        self.assertEqual(flag(self.argv(), "--session-id"), sid)
 
-class JobLifecycleTests(Base):
-    def test_sync_failure_exit_code_and_stderr_tail(self):
+    def test_failure_exit_code_and_stderr(self):
         r = self.pier("run", "reviewer", "x", env={"MOCK_PI_FAIL": "1"})
         self.assertEqual(r.returncode, 3)
-        d = self.j(r)
-        self.assertEqual(d["state"], "failed")
-        self.assertIn("simulated", d["stderr_tail"])
+        self.assertEqual(r.stdout, "")
+        self.assertIn("pi exited 3", r.stderr)
+        self.assertIn("simulated", r.stderr)
+
+    def test_model_error_is_failure_not_intermediate_text(self):
+        for stop in ("error", "aborted"):
+            r = self.pier("run", "reviewer", "x", env={"MOCK_PI_STOP": stop})
+            self.assertEqual(r.returncode, 1, stop)
+            self.assertEqual(r.stdout, "", stop)  # never the "let me look" text
+            self.assertIn(f"model run {stop}: mock {stop}: 529 overloaded", r.stderr)
+            r = self.pier("result", self.sid_of(r))
+            self.assertEqual(r.returncode, 1)
+
+    def test_length_prints_partial_reply_and_fails(self):
+        r = self.pier("run", "reviewer", "x", env={"MOCK_PI_STOP": "length", "MOCK_PI_REPLY": "PARTIAL"})
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout, "PARTIAL\n")
+        self.assertIn("output token limit", r.stderr)
+
+    def test_over_budget_reply_spills_to_file(self):
+        reply = "A" * 50_000
+        r = self.pier("run", "reviewer", "x", env={"MOCK_PI_REPLY": reply})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        sid = self.sid_of(r)
+        path = self.state() / "out" / f"{sid}.md"
+        self.assertEqual(path.read_text(encoding="utf-8"), reply)  # byte-identical spill
+        lines = r.stdout.splitlines()
+        self.assertEqual(lines[0], "A" * 2_000)  # 2k preview
+        self.assertRegex(lines[-1], r"\[\.\.\. 48000 more chars; full reply: .+\]$")  # last line = path
+        self.assertIn(str(path), lines[-1])
+        r = self.pier("result", sid, "--max-chars", "0")
+        self.assertEqual(r.stdout, f"full reply: {Path(path).resolve()}\n")  # 0 = path only (resolve: /var symlink)
+        r = self.pier("result", sid, "--max-chars", "100000")
+        self.assertEqual(r.stdout, reply + "\n")  # a large budget inlines it all
+
+    def test_max_chars_env_default_and_failure_keeps_path_last(self):
+        reply = "B" * 30_000
+        r = self.pier("run", "reviewer", "x", env={"MOCK_PI_REPLY": reply, "PIER_MAX_CHARS": "5000"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        sid = self.sid_of(r)
+        lines = r.stdout.splitlines()
+        self.assertEqual(lines[0], "B" * 2_000)
+        self.assertIn(str(Path(self.state() / "out" / f"{sid}.md").resolve()), lines[-1])
+        # a nonzero exit keeps the path as stdout's last line
+        r = self.pier("send", sid, "again", "--max-chars", "10",
+                      env={"MOCK_PI_REPLY": reply, "MOCK_PI_STOP": "length"})
+        self.assertEqual(r.returncode, 1)
+        self.assertTrue(r.stdout.splitlines()[-1].startswith("[... "), r.stdout)
 
     def test_missing_pi(self):
         r = self.pier("run", "reviewer", "x", env={"PI_BIN": "/nonexistent/pi"})
         self.assertEqual(r.returncode, 2)
         self.assertIn("does not install Pi", r.stderr)
-        self.assertEqual(self.pier("run", "reviewer", "x", "--dry-run", env={"PI_BIN": "/nonexistent/pi"}).returncode, 0)
-
-    def test_stdin_not_leaked_to_pi(self):
-        r = self.pier("run", "reviewer", "--task", "T")
+        self.assertFalse((self.state() / "sessions").exists())
+        r = self.pier("run", "reviewer", "x", "--dry-run", env={"PI_BIN": "/nonexistent/pi"})
         self.assertEqual(r.returncode, 0)
-        self.assertNotIn("leak", self.j(r)["result_preview"])
 
-    def test_background_and_await(self):
-        d = self.j(self.pier("start", "reviewer", "bg job", env={"MOCK_PI_SLEEP": "0.5"}))
-        jid = d["job_id"]
-        r = self.pier("await", jid, "--timeout", "20")
-        self.assertEqual(r.returncode, 0, r.stdout)
-        self.assertEqual(self.j(r)["state"], "completed")
-        r = self.pier("result", jid)
-        self.assertIn("mock-ok: bg job", r.stdout)
-
-    def test_cancel(self):
-        d = self.j(self.pier("start", "reviewer", "slow", env={"MOCK_PI_SLEEP": "30"}))
-        jid = d["job_id"]
-        for _ in range(50):
-            if self.j(self.pier("status", jid)).get("state") == "running":
-                break
-            time.sleep(0.1)
-        self.j(self.pier("cancel", jid))
-        r = self.pier("await", jid, "--timeout", "10")
-        self.assertEqual(self.j(r)["state"], "cancelled")
-        self.assertEqual(r.returncode, 1)
-
-    def test_resume_uses_session_not_continue(self):
-        d = self.j(self.pier("run", "reviewer", "first"))
-        r = self.pier("resume", d["job_id"], "follow up")
+    def test_send_replays_agent_setup(self):
+        self.write_agent(".pier/agents/r.md",
+                         "---\nname: r\ntools: read\ninheritProjectContext: false\n---\nROLE R\n")
+        sid = self.sid_of(self.pier("run", "r", "first"))
+        r = self.pier("send", sid, "follow", "up", cwd=self.tmp)
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, f"mock-ok: follow up [resumed {sid}]\n")
         a = self.argv()
-        self.assertNotIn("--continue", a)
-        ref = a[a.index("--session") + 1]
-        self.assertTrue(ref.endswith(d["session_id"] + ".jsonl"))
-        self.assertIn("[resumed", self.j(r)["result_preview"])
-        self.assertEqual(a[-1], "## Task\n\nfollow up\n")
-        self.assertNotIn("--system-prompt", a)
-        self.assertNotIn("--append-system-prompt", a)
+        self.assertEqual(flag(a, "--system-prompt"), "ROLE R")
+        self.assertEqual(flag(a, "--tools"), "read")
+        self.assertIn("--no-context-files", a)
+        self.assertTrue(flag(a, "--session").endswith(f"_{sid}.jsonl"))
+        self.assertNotIn("--session-id", a)
+        self.assertEqual(self.calls()[-1][-1], "follow up")
 
-    def test_resume_falls_back_to_session_id(self):
-        d = self.j(self.pier("run", "reviewer", "first"))
-        pier_home = self.home / ".pier"
-        st_path = pier_home / "jobs" / d["job_id"] / "status.json"
-        st = json.loads(st_path.read_text())
-        st["session_file"] = None
-        st_path.write_text(json.dumps(st))
-        for f in (pier_home / "sessions").glob("*.jsonl"):
-            f.rename(f.with_name("sub_" + f.name))
-        r = self.pier("resume", d["job_id"], "again", "--dry-run")
-        a = self.j(r)["argv"]
-        self.assertNotIn("--continue", a)
-        self.assertIn("--session", a)
-
-    def test_resume_no_session_errors(self):
-        d = self.j(self.pier("run", "reviewer", "x", "--no-session"))
-        r = self.pier("resume", d["job_id"], "y")
+    def test_send_unknown_session(self):
+        r = self.pier("send", "00000000-0000-0000-0000-000000000000", "x")
         self.assertEqual(r.returncode, 2)
-        self.assertIn("--no-session", r.stderr)
-
-
-class BatchTests(Base):
-    def write_batch(self, data, name="jobs.json"):
-        p = self.proj / name
-        p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        return p
-
-    def test_mixed_results_exit_nonzero(self):
-        (self.proj / "t3.md").write_text("task from file 中文")
-        p = self.write_batch({"defaults": {"agent": "reviewer", "model": "m-default"}, "concurrency": 2, "jobs": [
-            {"id": "a", "task": "alpha"},
-            {"id": "b", "task": "BOOM please", "model": "m-override"},
-            {"id": "c", "task_file": "t3.md", "agent": None, "instructions": "Custom role"},
-        ]})
-        r = self.pier("batch", "run", "--file", str(p), env={"MOCK_PI_FAIL_ON": "BOOM"})
-        self.assertEqual(r.returncode, 1)
-        d = self.j(r)
-        st = {j["id"]: j for j in d["jobs"]}
-        self.assertEqual(st["a"]["state"], "completed")
-        self.assertEqual(st["b"]["state"], "failed")
-        self.assertEqual(st["b"]["exit_code"], 3)
-        self.assertIn("simulated", st["b"]["stderr_tail"])
-        self.assertEqual(st["c"]["state"], "completed")
-        self.assertFalse(d["ok"])
-        calls = self.calls()
-        self.assertEqual(len(calls), 3)
-        models = sorted(c[c.index("--model") + 1] for c in calls)
-        self.assertEqual(models, ["m-default", "m-default", "m-override"])
-        custom = [c for c in calls if "--system-prompt" in c and c[c.index("--system-prompt") + 1] == "Custom role"][0]
-        self.assertNotIn("rigorous code reviewer", " ".join(custom))
-        self.assertNotIn("--name", custom)
-
-    def test_all_ok_exit_zero_and_preview(self):
-        p = self.write_batch([{"agent": "explorer", "task": "x" * 250}, {"agent": "planner", "task": "p"}])
-        r = self.pier("batch", "run", "--file", str(p))
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        d = self.j(r)
-        self.assertTrue(d["ok"])
-        self.assertTrue(d["jobs"][0]["result_truncated"])
-        self.assertEqual(len(d["jobs"][0]["result_preview"]), 200)
-        self.assertNotIn("result", d["jobs"][0])
-        r = self.pier("batch", "result", d["batch_id"])
-        self.assertIn("x" * 250, r.stdout)
-
-    def test_atomic_validation_starts_nothing(self):
-        p = self.write_batch({"jobs": [
-            {"agent": "reviewer", "task": "ok"},
-            {"agent": "nope", "task": "x"},
-            {"task": "no agent"},
-            {"agent": "reviewer", "task": "t", "bogus": 1},
-            {"agent": "reviewer"},
-        ]})
-        r = self.pier("batch", "run", "--file", str(p))
+        self.assertIn("unknown session", r.stderr)
+        r = self.pier("send", "deadbeef", "x")
         self.assertEqual(r.returncode, 2)
-        d = self.j(r)
-        self.assertEqual(sorted(e["index"] for e in d["errors"]), [1, 2, 3, 4])
-        self.assertEqual(d["started"], 0)
-        self.assertEqual(self.calls(), [])
-        self.assertFalse((self.proj / ".pier" / "jobs").exists() and any((self.proj / ".pier" / "jobs").iterdir()))
+        # an unknown ref after at least one run hints at the recent sessions
+        first = self.pier("run", "reviewer", "hello")
+        r = self.pier("send", "deadbeef", "x")
+        self.assertIn("recent sessions:", r.stderr)
+        self.assertIn(self.ref_of(first), r.stderr)
 
-    def test_stdin_and_dry_run(self):
-        data = json.dumps({"jobs": [{"agent": "reviewer", "task": "q \"x\" 中文"}]})
-        r = self.pier("batch", "run", "--file", "-", "--dry-run", input_text=data)
+    def test_run_stderr_is_started_then_summary(self):
+        r = self.pier("run", "reviewer", "hello")
+        ref = self.ref_of(r)
+        self.assertEqual(r.stderr.splitlines(),
+                         [f"pier: {ref} started (reviewer)",
+                          f"pier: {ref} ok (reviewer) · 1k tok · $0.01"])
+        r = self.pier("run", "reviewer", "x", env={"MOCK_PI_FAIL": "1"})
+        ref = self.ref_of(r)
+        line = r.stderr.splitlines()[1]
+        self.assertTrue(line.startswith(f"pier: {ref} failed (reviewer)"), r.stderr)
+        self.assertIn(" — ", line)  # the failure reason is appended
+
+    def test_send_resolves_prefix_name_and_errors_on_ambiguity(self):
+        sid = self.sid_of(self.pier("run", "reviewer", "first"))
+        r = self.pier("send", sid[:12], "via prefix", cwd=self.tmp)
         self.assertEqual(r.returncode, 0, r.stderr)
-        d = self.j(r)
-        self.assertEqual(len(d["jobs"]), 1)
-        self.assertIn("中文", d["jobs"][0]["prompt"])
-        self.assertEqual(self.calls(), [])
+        self.assertIn("[resumed", r.stdout)
+        r = self.pier("send", "reviewer", "via name", cwd=self.tmp)  # --name handle
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # same --name twice: newest wins (the later run's session)
+        self.pier("run", "reviewer", "second", "--name", "dup")
+        newest = self.sid_of(self.pier("run", "reviewer", "third", "--name", "dup"))
+        r = self.pier("send", "dup", "newest", cwd=self.tmp)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"[resumed {newest}", r.stdout)
+        # an ambiguous prefix names its alternatives
+        other = self.state() / "sessions" / f"{sid[:6]}aa{sid[6:].replace('-', '')}.pier.json"
+        other.write_text(json.dumps({"cwd": str(self.tmp), "flags": [], "name": "other"}), encoding="utf-8")
+        try:
+            r = self.pier("send", sid[:6], "x")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("ambiguous", r.stderr)
+            self.assertIn(sid[:6], r.stderr)  # the alternatives are named by their refs
+        finally:
+            other.unlink()
 
-    def test_concurrency_limit(self):
-        p = self.write_batch({"concurrency": 2, "jobs": [{"agent": "reviewer", "task": f"t{i}"} for i in range(4)]})
-        t0 = time.time()
-        r = self.pier("batch", "run", "--file", str(p), env={"MOCK_PI_SLEEP": "0.6"})
-        elapsed = time.time() - t0
-        self.assertEqual(r.returncode, 0)
-        self.assertGreater(elapsed, 1.1)  # 4 jobs / 2 workers * 0.6s
-        self.assertEqual(self.pier("batch", "run", "--file", str(p), "--concurrency", "0").returncode, 2)
+    def test_result_reads_last_turn_only(self):
+        sid = self.sid_of(self.pier("run", "reviewer", "first"))
+        self.assertEqual(self.pier("result", sid).stdout, "mock-ok: first\n")
+        r = self.pier("send", sid, "second", env={"MOCK_PI_FAIL": "1"})
+        self.assertEqual(r.returncode, 3)
+        r = self.pier("result", sid)
+        self.assertEqual(r.returncode, 1)  # never hands back the stale first reply
+        self.assertIn("no reply after the last prompt", r.stderr)
 
-    def test_start_await_status_cancel(self):
-        p = self.write_batch({"jobs": [{"id": "fast", "agent": "reviewer", "task": "fast"},
-                                       {"id": "slow", "agent": "reviewer", "task": "SLOWME"}]})
-        d = self.j(self.pier("batch", "start", "--file", str(p), env={"MOCK_PI_SLEEP_ON": "SLOWME"}))
-        bid = d["batch_id"]
-        self.assertEqual(len(d["job_ids"]), 2)
+    def test_killed_pier_stops_pi_and_session_survives(self):
+        p = subprocess.Popen([sys.executable, str(PIER), "run", "reviewer", "slow"], cwd=str(self.proj),
+                             env=self.full_env({"MOCK_PI_SLEEP": "30"}), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         for _ in range(100):
-            s = self.j(self.pier("status", "--batch", bid))
-            states = {j["id"]: j["state"] for j in s["jobs"]}
-            if states["fast"] == "completed" and states["slow"] == "running":
+            if self.rec_dir.exists() and any(self.rec_dir.iterdir()):
                 break
-            time.sleep(0.1)
-        self.pier("batch", "cancel", bid)
-        r = self.pier("batch", "await", bid, "--timeout", "15")
-        self.assertEqual(r.returncode, 1)
-        states = {j["id"]: j["state"] for j in self.j(r)["jobs"]}
-        self.assertEqual(states, {"fast": "completed", "slow": "cancelled"})
-        jids = d["job_ids"]
-        r = self.pier("cancel", "--jobs", ",".join(jids))
-        self.assertEqual(r.returncode, 0)
-
-
-
-class CwdDecouplingTests(Base):
-    """--cwd is Pi workdir only; pier state lives under ~/.pier (or PIER_HOME)."""
-
-    def pier_state(self):
-        return Path(self.home) / ".pier"
-
-    def test_run_stores_under_home_not_project(self):
-        other = self.tmp / "other-proj"
-        other.mkdir()
-        d = self.j(self.pier("run", "reviewer", "hello", "--cwd", str(self.proj)))
-        jid = d["job_id"]
-        self.assertTrue((self.pier_state() / "jobs" / jid / "status.json").is_file())
-        self.assertFalse((self.proj / ".pier" / "jobs").exists())
-        self.assertFalse((other / ".pier").exists())
-        # sessions isolated under pier home, not project / Pi default
-        a = self.argv()
-        sdir = a[a.index("--session-dir") + 1]
-        self.assertEqual(Path(sdir).resolve(), (self.pier_state() / "sessions").resolve())
-        self.assertTrue(sdir.startswith(str(self.pier_state())))
-        # project agents dir may exist from lookup, but no runtime dirs
-        for name in ("jobs", "batches", "sessions"):
-            self.assertFalse((self.proj / ".pier" / name).exists())
-
-    def test_status_await_result_resume_from_other_cwd(self):
-        d = self.j(self.pier("run", "reviewer", "first", "--cwd", str(self.proj)))
-        jid = d["job_id"]
-        elsewhere = self.tmp / "elsewhere"
-        elsewhere.mkdir()
-        # no --cwd needed
-        st = self.j(self.pier("status", jid, cwd=elsewhere))
-        self.assertEqual(st["job_id"], jid)
-        self.assertEqual(st["state"], "completed")
-        r = self.pier("result", jid, cwd=elsewhere)
-        self.assertIn("mock-ok: first", r.stdout)
-        r = self.pier("resume", jid, "follow", cwd=elsewhere)
+            time.sleep(0.05)
+        time.sleep(0.2)
+        pi_pid = int(next(self.rec_dir.iterdir()).stem.rsplit("-", 1)[1])
+        p.send_signal(signal.SIGTERM)  # pier only, as a host timeout might
+        self.assertEqual(p.wait(timeout=10), 128 + signal.SIGTERM)
+        sid = p.stderr.read().split()[1]  # `pier: <ref> started (...)`
+        for _ in range(100):
+            try:
+                os.kill(pi_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("Pi outlived pier")
+        p.stdout.close()
+        p.stderr.close()
+        r = self.pier("send", sid, "continue")  # the 8-char ref resolves
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("[resumed", self.j(r)["result_preview"])
-        # resume also wrote under home, not under elsewhere or project
-        self.assertFalse((elsewhere / ".pier").exists())
-        self.assertFalse((self.proj / ".pier" / "jobs").exists())
+        self.assertIn("[resumed", r.stdout)
+
+    def test_ps_three_states(self):
+        ok = self.sid_of(self.pier("run", "reviewer", "first"))
+        dead = self.sid_of(self.pier("run", "reviewer", "kill me", env={"MOCK_PI_SLEEP": "30"}))
+        # a slow run shows as running while pier is alive; killed -> failed
+        slow = subprocess.Popen([sys.executable, str(PIER), "run", "reviewer", "slow"],
+                                cwd=str(self.proj), env=self.full_env({"MOCK_PI_SLEEP": "30"}),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        try:
+            for _ in range(100):
+                if self.rec_dir.exists() and len(list(self.rec_dir.iterdir())) >= 1:
+                    break
+                time.sleep(0.05)
+            time.sleep(0.3)
+            r = self.pier("ps")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("running", r.stdout)
+            rows = [line for line in r.stdout.splitlines() if line.startswith("sessions") or "," in line]
+            self.assertIn("ok", r.stdout)
+            slow.send_signal(signal.SIGTERM)
+            self.assertEqual(slow.wait(timeout=10), 128 + signal.SIGTERM)
+            slow.stdout.close()
+            slow.stderr.close()
+        finally:
+            if slow.poll() is None:
+                slow.terminate()
+                slow.wait(timeout=10)
+                slow.stdout.close()
+                slow.stderr.close()
+        r = self.pier("ps")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("running", r.stdout)  # killed run: pid dead -> failed
+        self.assertIn("failed", r.stdout)
+        r = self.pier("ps", self.ref_of(self.pier("run", "reviewer", "again")))
+        # ps REF narrows to one row (the TOON header line also holds commas)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rows = [l for l in r.stdout.splitlines() if "," in l and not l.startswith("sessions")]
+        self.assertEqual(len(rows), 1)
+
+
+class WorktreeTests(Base):
+    def git(self, *args, cwd=None):
+        r = subprocess.run(["git", *args], cwd=str(cwd or self.proj), capture_output=True,
+                           text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def setUp(self):
+        super().setUp()
+        self.git("init", "-q")
+        self.git("config", "user.email", "t@t")
+        self.git("config", "user.name", "t")
+        (self.proj / "f.txt").write_text("base\n", encoding="utf-8")
+        self.git("add", "f.txt")
+        self.git("commit", "-qm", "base")
+
+    def run_with_worktree_mutation(self, mutate):
+        """Start a slow --worktree run in the background, mutate its worktree
+        while Pi runs, and return (worktree path, run stderr)."""
+        slow = subprocess.Popen(
+            [sys.executable, str(PIER), "run", "reviewer", "x", "--worktree"],
+            cwd=str(self.proj), env=self.full_env({"MOCK_PI_SLEEP": "3"}),
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            wt = None
+            wtdir = self.state() / "worktrees"
+            for _ in range(100):
+                if wtdir.is_dir() and any(wtdir.iterdir()):
+                    wt = next(iter(wtdir.iterdir()))
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(wt, "worktree never appeared")
+            for _ in range(100):  # wait for the checkout to finish before mutating
+                if (wt / "f.txt").is_file() and \
+                        (wt / "f.txt").read_text(encoding="utf-8") == "base\n":
+                    break
+                time.sleep(0.05)
+            mutate(wt)
+            for _ in range(200):
+                if slow.poll() is not None:
+                    break
+                time.sleep(0.1)
+            stderr = slow.stderr.read()
+            self.assertEqual(slow.wait(timeout=10), 0, stderr)
+            return wt, stderr
+        finally:
+            if slow.poll() is None:
+                slow.terminate()
+                slow.wait(timeout=10)
+            slow.stdout.close()
+            slow.stderr.close()
+
+    def test_clean_worktree_is_auto_removed(self):
+        r = self.pier("run", "reviewer", "hello", "--worktree")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        ref = self.ref_of(r)
+        wt = self.state() / "worktrees" / ref
+        side = json.loads((self.state() / "sessions" / f"{self.sid_of(r)}.pier.json").read_text())
+        self.assertEqual(Path(side["worktree"]).resolve(), wt.resolve())
+        self.assertFalse(wt.exists())  # clean + HEAD unmoved -> removed
+        self.assertNotIn("kept worktree", r.stderr)
+
+    def test_dirty_worktree_is_kept_with_path_on_stderr(self):
+        wt, stderr = self.run_with_worktree_mutation(
+            lambda w: (w / "f.txt").write_text("edited\n", encoding="utf-8"))
+        self.assertIn("kept worktree", stderr)
+        self.assertIn(str(wt), stderr)
+        self.assertTrue(wt.is_dir())
+        # pier does not touch the caller's checkout
+        self.assertEqual((self.proj / "f.txt").read_text(), "base\n")
+
+    def test_head_moved_worktree_is_kept(self):
+        # a commit inside the worktree counts as a change even with clean status
+        wt, stderr = self.run_with_worktree_mutation(
+            lambda w: self.git("commit", "-qm", "agent work", "--allow-empty", cwd=w))
+        self.assertIn("kept worktree", stderr)
+        self.assertTrue(wt.is_dir())
+
+    def test_worktree_in_non_repo_errors(self):
+        bare = self.tmp / "not a repo"
+        bare.mkdir()
+        r = self.pier("run", "reviewer", "x", "--worktree", cwd=bare)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not a git repository", r.stderr)
+
+
+class StorageTests(Base):
+    def test_state_only_under_pier_home(self):
+        other = self.tmp / "other"
+        other.mkdir()
+        sid = self.sid_of(self.pier("run", "reviewer", "hello", "--cwd", str(self.proj), cwd=other))
+        self.assertFalse((self.proj / ".pier").exists())
+        self.assertFalse((other / ".pier").exists())
+        files = sorted(str(p.relative_to(self.state())) for p in self.state().rglob("*") if p.is_file())
+        self.assertEqual(len(files), 2, files)
+        self.assertIn(f"sessions/{sid}.pier.json", files)
+        pi_file = [f for f in files if f.endswith(".jsonl")][0]
+        self.assertTrue(pi_file.startswith("sessions/--") and pi_file.endswith(f"_{sid}.jsonl"))
 
     def test_pier_home_override(self):
-        custom = self.tmp / "custom-pier-home"
-        d = self.j(self.pier("run", "reviewer", "x", env={"PIER_HOME": str(custom)}))
-        jid = d["job_id"]
-        self.assertTrue((custom / "jobs" / jid / "status.json").is_file())
-        self.assertFalse((self.home / ".pier" / "jobs").exists())
-        self.assertFalse((self.proj / ".pier" / "jobs").exists())
-        other = self.tmp / "somewhere-else"
-        other.mkdir()
-        st = self.j(self.pier("status", jid, env={"PIER_HOME": str(custom)}, cwd=other))
-        self.assertEqual(st["state"], "completed")
-        # dry-run reports pier_home
-        dr = self.j(self.pier("run", "reviewer", "y", "--dry-run", env={"PIER_HOME": str(custom)}))
-        self.assertEqual(Path(dr["pier_home"]).resolve(), custom.resolve())
-
-    def test_session_dir_isolated_from_project(self):
-        d = self.j(self.pier("run", "reviewer", "s"))
-        a = self.argv()
-        sdir = Path(a[a.index("--session-dir") + 1]).resolve()
-        self.assertEqual(sdir, (self.pier_state() / "sessions").resolve())
-        self.assertNotEqual(sdir, (self.proj / ".pier" / "sessions").resolve())
-        # session files landed only under pier home
-        sessions = list((self.pier_state() / "sessions").glob("*.jsonl"))
-        self.assertTrue(sessions)
-        self.assertFalse((self.proj / ".pier" / "sessions").exists())
-        self.assertTrue(d.get("session_id"))
-
-    def test_project_pier_runtime_state_is_never_read(self):
-        """A <cwd>/.pier/jobs|batches tree is ignored by every query command."""
-        jid, bid = "jplanted0001", "bplanted0001"
-        jdir = self.proj / ".pier" / "jobs" / jid
-        jdir.mkdir(parents=True)
-        (jdir / "status.json").write_text(json.dumps({
-            "job_id": jid, "state": "completed", "exit_code": 0, "cwd": str(self.proj),
-            "mode": "json", "session_id": "s1", "result_path": str(jdir / "result.md"),
-        }), encoding="utf-8")
-        (jdir / "result.md").write_text("PLANTED\n", encoding="utf-8")
-        bdir = self.proj / ".pier" / "batches" / bid
-        bdir.mkdir(parents=True)
-        (bdir / "batch.json").write_text(json.dumps({"batch_id": bid, "jobs": [jid]}), encoding="utf-8")
-        home_jobs = str(self.pier_state())
-        for args in (("status", jid), ("await", jid, "--timeout", "1"), ("result", jid),
-                     ("cancel", jid), ("resume", jid, "x", "--dry-run"),
-                     ("status", "--batch", bid), ("batch", "status", bid), ("batch", "result", bid)):
-            r = self.pier(*args, cwd=self.proj)
-            self.assertNotEqual(r.returncode, 0, args)
-            self.assertNotIn("PLANTED", r.stdout + r.stderr, args)
-            self.assertIn("unknown", r.stderr, args)
-            self.assertIn(home_jobs, r.stderr, args)
-            self.assertNotIn(str(self.proj / ".pier"), r.stderr, args)
-        # list only shows ~/.pier jobs
-        self.j(self.pier("run", "reviewer", "fresh", "--cwd", str(self.proj)))
-        rows = self.j(self.pier("list", cwd=self.proj))
-        self.assertEqual(len(rows), 1)
-        self.assertNotEqual(rows[0]["job_id"], jid)
-        # planted tree untouched; nothing new written beside it
-        self.assertEqual([p.name for p in (self.proj / ".pier" / "jobs").iterdir()], [jid])
-        self.assertEqual(json.loads((jdir / "status.json").read_text())["state"], "completed")
-
-    def test_query_commands_have_no_cwd_flag(self):
-        d = self.j(self.pier("run", "reviewer", "q"))
-        jid = d["job_id"]
-        for args in (("status", jid), ("await", jid), ("result", jid), ("cancel", jid),
-                     ("list",), ("resume", jid, "x", "--dry-run"), ("batch", "status", "b1")):
-            r = self.pier(*args, "--cwd", str(self.proj))
-            self.assertEqual(r.returncode, 2, args)
-            self.assertIn("unrecognized arguments: --cwd", r.stderr, args)
-
+        alt = self.tmp / "alt"
+        sid = self.sid_of(self.pier("run", "reviewer", "x", env={"PIER_HOME": str(alt)}), home=alt)
+        self.assertTrue((alt / "sessions" / f"{sid}.pier.json").exists())
+        self.assertFalse(self.state().exists())
 
 
 class ToonEncodeTests(unittest.TestCase):
@@ -738,26 +788,6 @@ class ToonEncodeTests(unittest.TestCase):
             "items[1]:\n  - users[2]{id,name}:\n      1,Ada\n      2,Bob\n    status: active",
         )
 
-    def test_cli_default_toon_and_json_flag(self):
-        tmp = Path(tempfile.mkdtemp(prefix="pier-toon-"))
-        try:
-            home = tmp / "home"; home.mkdir()
-            proj = tmp / "proj"; proj.mkdir()
-            env = {k: v for k, v in os.environ.items()}
-            env.update({"PI_BIN": str(MOCK), "HOME": str(home), "PIER_QUIET": "1"})
-            r = subprocess.run([sys.executable, str(PIER), "agents", "list"], cwd=str(proj), env=env,
-                               capture_output=True, text=True, timeout=30)
-            self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertTrue(r.stdout.lstrip().startswith("["), r.stdout)
-            self.assertIn("{name,description}", r.stdout)
-            r2 = subprocess.run([sys.executable, str(PIER), "agents", "list", "--json"], cwd=str(proj), env=env,
-                                capture_output=True, text=True, timeout=30)
-            rows = json.loads(r2.stdout)
-            self.assertTrue(isinstance(rows, list) and rows)
-            self.assertEqual(set(rows[0].keys()), {"name", "description"})
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-
     def test_matches_official_encode_when_available(self):
         if not self._official_available():
             self.skipTest("official @toon-format/cli not installed")
@@ -814,18 +844,28 @@ class SystemPromptAndResourcesTests(Base):
     def test_system_prompt_mode_append(self):
         self.write_agent(".pier/agents/a.md",
                          "---\nname: a\nsystemPromptMode: append\n---\nAPPEND ME\n")
-        d = self.j(self.pier("run", "a", "t", "--dry-run"))
-        self.assertIn("--append-system-prompt", d["argv"])
-        self.assertNotIn("--system-prompt", d["argv"])
-        self.assertEqual(d["argv"][d["argv"].index("--append-system-prompt") + 1], "APPEND ME")
+        a = self.dry("run", "a", "t")
+        self.assertNotIn("--system-prompt", a)
+        self.assertEqual(flag(a, "--append-system-prompt"), "APPEND ME")
+
+    def test_report_contract_appended_after_role(self):
+        # every run carries the ~60-token report contract, after the agent's own prompt
+        a = self.dry("run", "reviewer", "t")
+        appends = [v for f, v in zip(a, a[1:]) if f == "--append-system-prompt"]
+        self.assertEqual(appends, [load_mod().REPORT_CONTRACT])
+        self.assertLess(a.index("--system-prompt"), a.index("--append-system-prompt"))
+        self.write_agent(".pier/agents/a.md",
+                         "---\nname: a\nsystemPromptMode: append\n---\nAPPEND ME\n")
+        a = self.dry("run", "a", "t")
+        self.assertEqual(a.count("--append-system-prompt"), 2)  # role append first, contract after
+        self.assertEqual(a[a.index("--append-system-prompt", a.index("--append-system-prompt") + 1) + 1],
+                         load_mod().REPORT_CONTRACT)
 
     def test_empty_skills_and_inherit_false(self):
         self.write_agent(".pier/agents/s.md", "---\nname: s\nskills:\n---\nB\n")
-        a = self.j(self.pier("run", "s", "t", "--dry-run"))["argv"]
-        self.assertIn("--no-skills", a)
+        self.assertIn("--no-skills", self.dry("run", "s", "t"))
         self.write_agent(".pier/agents/s2.md", "---\nname: s2\ninheritSkills: false\n---\nB\n")
-        a = self.j(self.pier("run", "s2", "t", "--dry-run"))["argv"]
-        self.assertIn("--no-skills", a)
+        self.assertIn("--no-skills", self.dry("run", "s2", "t"))
 
     def test_named_skill_and_skill_path(self):
         skill_dir = self.proj / ".pi" / "skills" / "demo-skill"
@@ -836,10 +876,10 @@ class SystemPromptAndResourcesTests(Base):
         (priv / "local-skill.md").write_text("---\nname: local\n---\nLocal.\n")
         self.write_agent(".pier/agents/s.md",
                          "---\nname: s\nskills: demo-skill\nskillPath: priv/local-skill.md\n---\nB\n")
-        a = self.j(self.pier("run", "s", "t", "--dry-run"))["argv"]
+        a = self.dry("run", "s", "t")
         skills = [a[i + 1] for i, x in enumerate(a) if x == "--skill"]
         self.assertEqual(len(skills), 2)
-        self.assertTrue(any(str(skill_dir / "SKILL.md") == s or s.endswith("demo-skill/SKILL.md") for s in skills))
+        self.assertTrue(any(s.endswith("demo-skill/SKILL.md") for s in skills))
         self.assertTrue(any(s.endswith("priv/local-skill.md") for s in skills))
 
     def test_unresolved_skill_errors(self):
@@ -854,50 +894,41 @@ class SystemPromptAndResourcesTests(Base):
         ext.write_text("// ext\n")
         self.write_agent(".pier/agents/e.md",
                          "---\nname: e\nextensions: my-ext.ts\nsubagentOnlyExtensions: builtin:foo\n---\nB\n")
-        a = self.j(self.pier("run", "e", "t", "--dry-run"))["argv"]
+        a = self.dry("run", "e", "t")
         self.assertIn("--no-extensions", a)
         exts = [a[i + 1] for i, x in enumerate(a) if x == "--extension"]
         self.assertEqual(len(exts), 2)
         self.assertTrue(any(e.endswith("my-ext.ts") for e in exts))
         self.assertIn("builtin:foo", exts)
         self.write_agent(".pier/agents/e2.md", "---\nname: e2\nextensions:\n---\nB\n")
-        a = self.j(self.pier("run", "e2", "t", "--dry-run"))["argv"]
+        a = self.dry("run", "e2", "t")
         self.assertIn("--no-extensions", a)
         self.assertNotIn("--extension", a)
 
     def test_inherit_project_context_false(self):
         self.write_agent(".pier/agents/c.md",
                          "---\nname: c\ninheritProjectContext: false\ninheritGlobalContext: false\n---\nB\n")
-        d = self.j(self.pier("run", "c", "t", "--dry-run"))
-        self.assertIn("--no-context-files", d["argv"])
-        self.assertIn("inheritGlobalContext", d["ignored_fields"])
-
-    def test_live_run_passes_system_prompt(self):
-        self.write_agent(".pier/agents/r.md", "---\nname: r\n---\nLIVE ROLE\n")
-        r = self.pier("run", "r", "do it")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        a = self.argv()
-        self.assertEqual(a[a.index("--system-prompt") + 1], "LIVE ROLE")
-        self.assertEqual(a[-1], "## Task\n\ndo it\n")
+        r = self.pier("run", "c", "t", "--dry-run")
+        self.assertIn("--no-context-files", shlex.split(r.stdout))
+        self.assertIn("inheritGlobalContext", r.stderr)
 
 
 @unittest.skipUnless(os.environ.get("PIER_TEST_REAL_PI"), "set PIER_TEST_REAL_PI=/path/to/pi")
 class RealPiArgvTests(Base):
-    """Real Pi parses pier's argv; empty HOME + --offline -> fails only on missing API key."""
+    """Real Pi parses pier's argv; an empty Pi config dir + no key env -> fails only on
+    the missing API key, so no model is called. HOME stays real for node shims."""
 
     def test_real_pi_accepts_argv(self):
         real = os.environ["PIER_TEST_REAL_PI"]
-        self.env["PI_BIN"] = real
         self.write_agent(".pier/agents/r.md", "---\nname: r\nmodel: anthropic/claude-sonnet-4-5:low\n"
                          "tools: read, grep\nexcludeTools: bash\n---\nRole \"q\" 中文\n")
-        clean = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home), "PI_BIN": real,
-                 "PIER_QUIET": "1"}
+        clean = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", ""), "PI_BIN": real,
+                 "PI_CODING_AGENT_DIR": str(self.tmp / "pi-agent"), "PIER_HOME": str(self.tmp / "pier-home")}
         r = subprocess.run([sys.executable, str(PIER), "run", "r", "task it's 中文", "--extra", "--offline"],
                            cwd=str(self.proj), env=clean, stdin=subprocess.DEVNULL,
                            capture_output=True, text=True, timeout=60)
-        d = json.loads(r.stdout)
-        self.assertNotIn("Unknown option", d.get("stderr_tail", ""))
-        self.assertIn("No API key", d.get("stderr_tail", ""))
+        self.assertNotIn("Unknown option", r.stderr)
+        self.assertIn("No API key", r.stderr)
         self.assertEqual(r.returncode, 1)
 
 

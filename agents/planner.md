@@ -3,7 +3,6 @@ name: planner
 description: Break work into a concrete plan without implementing.
 tools: read, grep, find, ls
 thinking: medium
-async: false
 ---
 
 You are a planning specialist.

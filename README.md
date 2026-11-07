@@ -1,145 +1,243 @@
 # pier
 
-用可复用的 agent Markdown 驱动 [Pi](https://pi.dev) coding agent：**一个命名 md → 一次 `pi` 调用**。
+Run [Pi](https://pi.dev) coding-agent subagents from reusable Markdown agent files.
+One `pier run`, one isolated `pi` session, one reply.
 
-- 借用 [pi-subagents](https://github.com/nicobailon/pi-subagents) 的 agent md 思路，**不依赖**该扩展，也不实现它的运行时（无嵌套 subagent、无 launcher、无 acceptance）。
-- 身份只用 frontmatter `name`（无 `package` / `aliases`）。仅映射可移植字段；其余字段忽略且不生效（stderr 一行提示）。
-- 与宿主无关：任何能跑 shell 的主会话直接调用；默认同步。
-- 不安装 Pi、不管理 API Key、不修改 Pi / pi-subagents 配置。
-- 结构化输出默认 [TOON 4.4](https://github.com/toon-format/spec)；各命令加 `--json` 输出 JSON。`pier result` 默认仍是原文。
+pier is a small, dependency-free Python CLI packaged as an agent skill. It is built to be
+called by another AI agent (Claude Code, Codex, or anything that can run a shell
+command), so its interface is optimised for few tool calls and few tokens:
 
-版本：**0.3.0**
+- **Synchronous.** `pier run` waits for Pi and prints only the reply. No job ids, no polling.
+- **One handle.** An 8-char session ref (or a `--name` handle) is the only thing to keep;
+  `send`, `result` and `ps` take it.
+- **Bounded output.** Replies over 24k chars are previewed and spilled to a file, so the
+  caller never re-reads a huge blob to fetch one detail.
+- **One way to do each thing.** No aliases or overlapping flags.
+- **Honest failures.** A provider error or abort is a failure even when Pi printed text
+  earlier in the turn. A killed pier takes Pi down with it.
 
-## 安装与调用
+The agent file format follows [pi-subagents](https://github.com/nicobailon/pi-subagents)
+(portable fields only). pier does not depend on that extension, install Pi, manage API
+keys, or change Pi configuration.
 
-依赖：Python 3.9+，Pi CLI（`pi` 在 PATH 上，或 `PI_BIN=/abs/path/pi`）。建议 Pi **1.4.0+**（`--system-prompt` / `--append-system-prompt` / `--skill` / `--extension` / `--no-skills` / `--no-extensions` / `--no-context-files`）。
+## Requirements
+
+- Python 3.9+ (standard library only)
+- The Pi CLI on `PATH`, or `PI_BIN=/abs/path/to/pi`
+
+pier is tested with Pi 1.4.0. Any Pi release works if it supports the flags pier passes:
+`--print`, `--session-dir`, `--session-id`, `--session`, `--system-prompt`, plus whichever
+your agents use (`--model`, `--provider`, `--thinking`, `--tools`, `--no-tools`,
+`--exclude-tools`, `--name`, `--append-system-prompt`, `--skill`, `--no-skills`,
+`--extension`, `--no-extensions`, `--no-context-files`). Use `--dry-run` to see the exact
+command.
+
+## Installation
+
+As a skill:
 
 ```bash
 npx skills add <path-or-repo> -y --skill pier
-python3 <skill>/scripts/pier.py agents list
-<skill>/scripts/pier agents list
 ```
 
-`--cwd` **只**决定 Pi 的工作目录，以及项目级 agent 查找根（`<cwd>/.pier/agents`）。Pier 自己的 jobs / batches / sessions 默认写在用户私有 `~/.pier/`（`PIER_HOME`），**不会**写进项目目录，因此也不会污染 Pi `/resume`。只有 `pier resume` 会续上一次 Pier 会话。
+Or clone the repository and call `scripts/pier` directly; it needs no install step
+and locates its own skill directory from its path, so the copy works under any host that
+can run a shell command. The repository root is the skill: `SKILL.md`, `agents/`,
+`references/` and `scripts/` live side by side.
 
-## 常用命令
+In Claude Code, the skill's `SKILL.md` injects the agent list when the skill loads
+(`` !`…/scripts/pier agents list` ``) and pre-approves `scripts/pier` through
+`allowed-tools`, so the calling agent can pick an agent without spending a tool call on
+listing. Hosts that do not expand that line must run that absolute path once instead.
 
-| 命令 | 作用 |
+## Quick start
+
+```bash
+./scripts/pier agents list
+./scripts/pier run reviewer "review src/auth.py"
+# stderr: pier: f3b2a1c0 started (reviewer)
+# stdout: the review
+# stderr: pier: f3b2a1c0 ok (reviewer) · 12k tok · $0.04
+
+./scripts/pier send f3b2a1c0 "also check the token refresh path"
+./scripts/pier ps                        # recent sessions of this project
+```
+
+## Usage
+
+`pier` in the tables below is shorthand for `scripts/pier` from the repository root.
+
+| Command | Description |
 |---|---|
-| `pier run AGENT [task…]` | 同步运行；默认 TOON；退出码 = Pi 退出码 |
-| `pier run AGENT --file task.md` | 任务从文件读（`--file -` = stdin；`--task-file` 同义） |
-| `pier run --agent-file role.md --file task.md` | 直接用某个 md |
-| `pier run --instructions "…" task…` | 全自定义（无 agent）；配 `--model/--provider/--thinking/--tools…` |
-| `pier run … --dry-run` | 只打印解析后的 Pi argv 与 prompt，不调用 pi、不建 job |
-| `pier start …` | 后台运行，返回 `job_id` |
-| `pier status/await/result/cancel JOB…` | 也接受 `--jobs a,b` 或 `--batch ID` |
-| `pier resume JOB "追问"` | 用该 job 的 Pi 会话继续（不重发 system prompt） |
-| `pier batch run\|start --file jobs.json` | 批量；`batch await\|status\|result\|cancel ID` |
-| `pier agents list\|show NAME [--resolved]\|paths` | 列表默认仅 name+description |
-| `pier agents validate FILE` / `pier agents new NAME --file F [--user\|--dir D]` | 校验 / 落盘 |
+| `pier run AGENT TASK...` | Start a new session, wait, print the reply |
+| `pier run AGENT --file task.md` | Read the task from a file (`-` = stdin) |
+| `pier run --agent-file role.md TASK...` | Use an agent file directly; frontmatter is optional |
+| `pier send SESSION TASK...` | Follow up in the same session with the same agent setup |
+| `pier result SESSION` | Print the last turn's reply again |
+| `pier ps [SESSION] [--cwd DIR]` | Recent sessions (default: this cwd, newest 10) as TOON rows |
+| `pier agents list \| show \| paths \| validate \| new` | Inspect, validate and save agent files |
 
-run/start 主要参数：`--cwd`、`--model`、`--provider`、`--thinking`、`--tools CSV`、`--no-tools`、`--exclude-tools CSV`、`--name`、`--mode json|print`、`--session`、`--session-id`、`--session-dir`、`--no-session`、`--handoff-file`、`--no-agent-body`、`--agent-dir`、`--json`、`--preview-chars`、`--full`、`--extra …`（必须放最后）。CLI 总是覆盖 frontmatter。
+`run` options: `--cwd DIR`, `--model PROVIDER/ID`, `--provider`, `--thinking LEVEL`,
+`--tools CSV` or `--no-tools`, `--exclude-tools CSV`, `--name HANDLE`, `--worktree`,
+`--max-chars N`, `--dry-run`, and `--extra ...` (raw Pi arguments, must be last;
+`--api-key` is rejected because flags are stored on disk). Command-line values override
+frontmatter. `pier <command> -h` documents every argument.
 
-## Agent 查找顺序（低 → 高，后者同名覆盖）
+### Handles
 
-1. `<skill>/agents/*.md`：内置示例/模板（不要修改）
-2. `--agent-dir`、`PIER_AGENT_DIRS`
-3. 用户级 `~/.pier/agents`（`PIER_USER_AGENTS_DIR` 可改）
-4. 项目级 `<cwd>/.pier/agents`：`pier agents new` 默认目标
+`run` prints an 8-char ref on stderr; the full session uuid and a `--name` handle
+(newest wins on repeats) resolve everywhere a session is taken. An unknown ref errors with
+a hint of the five most recent sessions, so the caller recovers without a second tool call.
 
-Pier **从不**读取 pi-subagents 目录、`~/.pi/agent/agents`、`<cwd>/.agents`、`<cwd>/.pi/agents`。`pier agents paths` 打印实际路径。编写规范见 [references/agent-authoring.md](references/agent-authoring.md)。
+### Output and exit codes
 
-## Frontmatter → Pi argv 映射表
+| Situation | stdout | stderr | Exit |
+|---|---|---|---|
+| Success | reply | `pier: <ref> started (agent)` + `pier: <ref> ok (agent) · Nk tok · $X` | 0 |
+| Model error or abort | — | `pier: error: model run error: …` | Pi's code, else 1 |
+| Reply cut off at the token limit | partial reply + `pier: error: … (continue it: pier send <ref> "continue")` | Pi's code, else 1 |
+| Pi exited non-zero | — | `pier: error: pi exited N: <stderr tail>` | N |
+| Invalid arguments, unknown agent or session, Pi not found | — | `pier: error: …` | 2 |
 
-| 字段 | Pi 参数 / 去向 |
+The started line is printed before Pi starts, so the ref survives a killed run. The final
+stderr line carries tokens and cost from the session's usage, so the caller gets the price
+without another tool call. `--dry-run` prints `cd <cwd> && pi …` and runs and writes
+nothing. `agents list`, `ps`, `paths`, `validate` and `new` print
+[TOON](https://github.com/toon-format/spec).
+
+### Output budget
+
+stdout is capped at `--max-chars` (default 24,000, env `PIER_MAX_CHARS`; `0` = path only).
+An over-budget reply is previewed (first 2k chars) and spilled byte-identical to
+`$PIER_HOME/out/<sid>.md`; stdout's last line is the path, so the caller reads the file
+directly instead of re-running with a bigger budget. `pier send <ref> "continue"` extends a
+reply cut off at the model's output token limit.
+
+### Long runs
+
+Pi runs often take minutes. If the host can run a command in the background (Claude Code:
+Bash with `run_in_background`), use that instead of a long foreground timeout; the host is
+notified when pier exits.
+
+Pi runs in pier's process group, and pier terminates it on `SIGTERM`, `SIGHUP` or
+`SIGINT`. A host timeout therefore never leaves Pi running with nobody to read its reply.
+The session keeps everything up to the interruption: `pier send SESSION "continue"`.
+`SIGKILL` cannot be intercepted: if only pier's pid gets it, Pi keeps running until it
+finishes.
+
+### Isolation: `--worktree`
+
+`pier run --worktree` gives the session a fresh `git worktree` of the caller's `HEAD`
+(detached, so uncommitted changes are not inherited). At exit, a pristine worktree
+(unmoved `HEAD`, clean `git status`) is removed automatically; anything else is kept and
+its path printed on stderr, so the caller can diff or commit the agent's changes.
+
+## Agent files
+
+```markdown
+---
+name: reviewer
+description: Code review focused on correctness, security, and clarity. Read-mostly.
+tools: read, grep, find, ls, bash
+excludeTools: write, edit
+thinking: medium
+---
+
+You are a rigorous code reviewer. ...
+```
+
+The body becomes Pi's system prompt. See [Writing agent files](references/agent-authoring.md)
+for every supported field. Example agents live in [`agents/`](agents/).
+
+Lookup order, lowest to highest priority (a later directory wins on the same name):
+
+1. `<skill>/agents` — bundled examples
+2. `$PIER_AGENT_DIRS` — extra directories, `:`-separated
+3. `$PIER_HOME/agents` — user agents (`agents new --user`)
+4. `<cwd>/.pier/agents` — project agents (`agents new` default)
+
+pier never reads pi-subagents directories (`~/.pi/agent/agents`, `.pi/agents`, `.agents`).
+
+### Frontmatter mapping
+
+| Field | Pi argument |
 |---|---|
-| `name` | `--name`（CLI `--name` 覆盖）；缺省用文件名；**查找键** |
-| `description`、`advertise`、`async` | 元数据，不映射 |
-| `model` | `--model` 原样；`inherit`/空 → 不传 |
-| `thinking` | `--thinking`；model 带 `:level` 后缀则不传；CLI `--thinking` 总是传 |
-| `defaultProvider` | `--provider`，仅当有 model 且不含 `/` |
-| `tools` | `--tools a,b`；空 → `--no-tools`；扩展专用工具名提示后丢弃 |
+| `name` | `--name`; defaults to the file name; lookup key |
+| `description` | none (shown by `pier agents list`; `validate` warns if missing) |
+| `model` | `--model` verbatim; `inherit` or empty = omitted |
+| `thinking` | `--thinking`, unless `model` has a `:level` suffix |
+| `defaultProvider` | `--provider`, only when `model` has no `provider/` prefix |
+| `tools` | `--tools a,b`; empty = `--no-tools`; extension-only tool names dropped |
 | `excludeTools` | `--exclude-tools a,b` |
-| `systemPromptMode` | 默认 `replace` → `--system-prompt`；`append` → `--append-system-prompt` |
-| `skills` / `skill` | 按名解析后重复 `--skill <path>`；空或 `inheritSkills: false` → `--no-skills`；未找到报错 |
-| `skillPath` | 重复 `--skill`（相对 agent md 目录） |
-| `extensions` | 空 → `--no-extensions`；非空 → `--no-extensions` + 重复 `--extension`（相对 agent md；`builtin:`/`npm:`/`git:`/`http(s):`/`file:`/绝对路径透传） |
-| `subagentOnlyExtensions` | 并入 `--extension` allowlist |
+| `systemPromptMode` | `replace` (default) = `--system-prompt`; `append` = `--append-system-prompt` |
+| `skills` / `skill` | repeated `--skill <resolved path>`; empty or `inheritSkills: false` = `--no-skills` |
+| `skillPath` | repeated `--skill <path>`, relative to the agent file |
+| `extensions`, `subagentOnlyExtensions` | `--no-extensions` + repeated `--extension`; empty `extensions` = `--no-extensions` only |
 | `inheritProjectContext: false` | `--no-context-files` |
-| `inheritGlobalContext` 及其他（launcher、timeoutMs、acceptance*、memory、output、嵌套…） | 不映射、无效果 |
-| 正文 body | Pi `--system-prompt` / `--append-system-prompt`（`--instructions` 覆盖；`--no-agent-body` 省略） |
+| anything else, including `advertise` / `async` | ignored, no effect (`validate` and `--dry-run` list it) |
 
-pier 固定附加：`--mode json`（或 `--print`）、`--session-dir <$PIER_HOME/sessions>` + `--session-id <uuid>`（或 `--no-session` / `--session REF`），最后 `-- <prompt>`。Pi 子进程 stdin 为 `/dev/null`。
+pier always adds `--print`, `--session-dir $PIER_HOME/sessions`, then `--session-id <new
+uuid>` (run) or `--session <session file>` (send), then `--append-system-prompt` with the
+report contract (the caller sees only the final message: result first, evidence as
+path:line, no preamble), then `-- <task>`. Pi's stdin and stdout go to `/dev/null`; the
+reply is read from the session file. Tasks over 100,000 bytes go through a temporary file
+passed as `@path`, deleted when Pi exits.
 
-### prompt 精确组合（用户消息）
+## Files
 
-角色正文走 system-prompt flag，**不**再拼进用户 prompt。非空段用一个空行连接，末尾一个换行：
+pier writes only these:
 
-```text
-## Context handoff        ← --handoff-file（可选）
+| Path | Content | When |
+|---|---|---|
+| `$PIER_HOME/sessions/<sid>.pier.json` | cwd, flags, name, pid, worktree of the run | before Pi starts |
+| `$PIER_HOME/sessions/--<cwd>--/<time>_<sid>.jsonl` | Pi's own session file | while Pi runs |
+| `$PIER_HOME/out/<sid>.md` | over-budget reply, byte-identical | spill on `--max-chars` |
+| `$PIER_HOME/worktrees/<ref>/` | `--worktree` checkout | while the session runs; kept when dirty |
+| `<tmp>/pier-*/prompt.md` | tasks over 100 KB | while Pi runs |
+| `<cwd>/.pier/agents/`, `$PIER_HOME/agents/` or `--dir` | agent files | `agents new` only |
 
-<handoff>
+It reads the four agent directories, files you pass (`--file`, `--agent-file`),
+and Pi's skill locations when resolving `skills:` names
+(`<cwd>/.pi/skills`, `<cwd>/.agents/skills`, `pi.skills` in `package.json` files,
+`.pi/settings.json`, `~/.pi/agent/skills`, `~/.agents/skills`, `~/.pi/agent/settings.json`).
+Pi itself reads and writes project files according to the agent's tools.
 
-## Task
+Old files under `$PIER_HOME` can be removed whenever their sessions are done.
 
-<task>
-```
+## Configuration
 
-例：正文 `ROLE LINE\n\nSecond para.`、任务 `DO THE THING` →
-- argv 含 `--system-prompt` + `ROLE LINE\n\nSecond para.`
-- 用户 prompt 精确为 `"## Task\n\nDO THE THING\n"`
+| Variable | Default | Meaning |
+|---|---|---|
+| `PI_BIN` | `pi` | Pi executable |
+| `PIER_HOME` | `~/.pier` | Sessions, spilled replies, worktrees, user agents |
+| `PIER_AGENT_DIRS` | — | Extra agent directories, `:`-separated |
+| `PIER_MAX_CHARS` | `24000` | Default `--max-chars` |
 
-`pier resume` 不重新附加 agent / system-prompt（沿用 Pi 会话原 system prompt）。
+## Design notes
 
-prompt 超过 100 000 字节时改用 `@<job>/prompt.txt`；超大 system prompt 写入 `<job>/system_prompt.txt` 后把路径传给对应 flag。
+**Why `--print` and not JSON or RPC mode.** In JSON mode Pi exits 0 when the final reply
+errors or is aborted; print mode exits non-zero. pier also checks the final message's
+`stopReason` in the session file, so a failed turn is never reported as success. RPC mode
+suits a long-lived controller; pier sends one prompt per process, so RPC would add a
+protocol client without making anything observable that the session file does not already
+show. See [docs/RESEARCH.md](docs/RESEARCH.md).
 
-## 批量
+**Why a sidecar file.** Pi's session file records cwd, model, thinking and messages, but
+not the system prompt, tools, skills or extensions. `<sid>.pier.json` keeps those flags
+so `send` continues with the same role; its pid also lets `pier ps` show which sessions
+are running.
 
-```json
-{
-  "defaults": {"agent": "reviewer", "model": "anthropic/claude-sonnet-4-5"},
-  "concurrency": 3,
-  "jobs": [
-    {"id": "auth", "task": "review src/auth.py"},
-    {"id": "db", "task_file": "tasks/db.md", "thinking": "high"},
-    {"id": "free", "agent": null, "instructions": "You are a release-notes writer.", "task": "…"}
-  ]
-}
-```
-
-- 也可直接给数组；`--file -` 从 stdin 读；`--concurrency` 覆盖文件（1–64，默认 4）。
-- 条目键：`id agent agent_file instructions role instructions_file task task_file handoff_file cwd provider model thinking tools exclude_tools no_tools mode name session_dir no_session no_agent_body extra agent_dirs`。
-- 原子校验：任一条无效 → 都不启动，退出 2。
-
-## 存储
-
-**运行态**在 `$PIER_HOME`（默认 `~/.pier/`）：`jobs/`、`batches/`、`sessions/`。
-**项目目录**只放 `<cwd>/.pier/agents/`。
-
-## 环境变量
-
-| 变量 | 含义 |
-|---|---|
-| `PI_BIN` | Pi 可执行文件（默认 `pi`） |
-| `PIER_HOME` | 运行态根（默认 `~/.pier`） |
-| `PIER_AGENT_DIRS` | 额外 agent 目录（`:` 分隔） |
-| `PIER_USER_AGENTS_DIR` | 用户级 agent 目录（默认 `~/.pier/agents`） |
-| `PIER_QUIET` | 设为 1 关闭 stderr 提示 |
-
-## 测试
+## Development
 
 ```bash
 python3 -m unittest discover -s tests -v
-PIER_TEST_REAL_PI=/path/to/pi python3 -m unittest discover -s tests
-shellcheck scripts/pier scripts/pier.sh
+PIER_TEST_REAL_PI=$(command -v pi) python3 -m unittest discover -s tests
 ```
 
-## 版本说明（0.3.0）
+Tests use [`mock/mock_pi`](mock/mock_pi) and never call a model. The optional real-Pi
+test points Pi at an empty config directory, so it only checks that Pi accepts pier's
+arguments and fails on the missing API key.
 
-相对 0.2.x：name-only 身份；移除 `--include-pi-subagents` 与一切 pi-subagents 目录读取；正文改走 Pi system-prompt flags；映射 skills/extensions/context flags（按 Pi 1.4.0 `--help` 实测）；默认 TOON 输出。
+## License
 
-本机 Mac 已核实 Pi 1.4.0 支持上述 flags（`--skill` 接 skill 文件或目录）。0.3.0 的端到端模型联调未在本轮重跑；以 mock 单测与 dry-run 映射为准。字段研究见 [docs/RESEARCH.md](docs/RESEARCH.md)。
-
-## 许可
-
-MIT
+[MIT](LICENSE)
