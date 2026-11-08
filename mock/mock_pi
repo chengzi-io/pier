@@ -15,6 +15,7 @@ Shaped after real Pi 1.5.0 behaviour that pier depends on:
   overrides the default
 
 Env: MOCK_PI_RECORD (file, last argv), MOCK_PI_RECORD_DIR (one file per call),
+MOCK_PI_RECORD_CWD (file, the cwd each call runs in),
 MOCK_PI_FAIL=1, MOCK_PI_FAIL_ON=<substring of prompt>, MOCK_PI_SLEEP=<s>,
 MOCK_PI_SLEEP_ON=<substring>, MOCK_PI_REPLY=<text>,
 MOCK_PI_STOP=error|aborted|length (final assistant stopReason; error/aborted first write
@@ -56,6 +57,9 @@ def main() -> int:
         Path(rec_dir).mkdir(parents=True, exist_ok=True)
         (Path(rec_dir) / f"{time.time_ns()}-{os.getpid()}.json").write_text(
             json.dumps(argv, ensure_ascii=False), encoding="utf-8")
+    rec_cwd = os.environ.get("MOCK_PI_RECORD_CWD")
+    if rec_cwd:
+        Path(rec_cwd).write_text(os.getcwd(), encoding="utf-8")
     if "--help" in argv:
         print("mock_pi")
         return 0

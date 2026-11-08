@@ -33,7 +33,7 @@ Output:
 | `model` | `--model` verbatim | e.g. `anthropic/claude-sonnet-4-5`, `provider/id:low`. `inherit` or empty = omitted |
 | `thinking` | `--thinking` | `off` `minimal` `low` `medium` `high` `xhigh` `max`. A `:level` suffix on `model` wins |
 | `defaultProvider` | `--provider` | Only when `model` has no `provider/` prefix |
-| `tools` | `--tools` CSV | Native Pi tools. Empty = `--no-tools`. Extension-only tool names are dropped |
+| `tools` | `--tools` CSV | Pi tool names. Empty = `--no-tools`. MCP tools (`mcp__<server>__<tool>` or `mcp__<server>__*`) pass through; extension-only names are dropped |
 | `excludeTools` | `--exclude-tools` CSV | |
 | `systemPromptMode` | `--system-prompt` / `--append-system-prompt` | `replace` (default) or `append` |
 | `skills` / `skill` | repeated `--skill <path>` | Names resolved from Pi's project, package, settings and user skill locations. Empty list or `inheritSkills: false` = `--no-skills`. An unknown name is an error |
@@ -75,5 +75,8 @@ pier agents new sql-reviewer --file /tmp/sql-reviewer.md --user   # $PIER_HOME/a
 ```
 
 - An existing file needs `--force`.
+- `validate` checks the name, body, `thinking`, `systemPromptMode` (`replace` or `append`),
+  the `inheritProjectContext` / `inheritSkills` booleans, and tool names; it warns about
+  fields with no effect (including `defaultProvider` without a `model`).
 - Do not write into this skill's `agents/` (examples; updates overwrite them).
 - Do not write into pi-subagents directories; use `--dir` only for a path the user names.

@@ -9,6 +9,7 @@ Does not install Pi, manage API keys, or rewrite Pi config.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -23,7 +24,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from shutil import which
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 VERSION = "0.1.0"
 
@@ -34,6 +35,9 @@ STDERR_TAIL_CHARS = 600
 # a preview + the spill path: the caller reads the file only if it needs the rest.
 DEFAULT_MAX_CHARS = 24_000
 PREVIEW_CHARS = 2_000
+# Long values (task text, system prompt) are clipped in --dry-run: the caller
+# needs the shape of the command, not a 100 KB copy of the prompt.
+DRY_RUN_ARG_CHARS = 400
 
 
 class PierError(Exception):
@@ -57,7 +61,9 @@ META_FIELDS = ("description",)
 # launcher, timeoutMs, acceptance*, memory, output, nested*, inheritGlobalContext,
 # ...) are ignored; `validate` and `--dry-run` report them.
 
-# pi-subagents runtime tool names; not native Pi tools. Dropped from tools lists.
+# pi-subagents runtime tool names; not Pi tools. Dropped from tools lists.
+# MCP tools are real Pi tool names (`mcp__<server>__<tool>`, or a glob such as
+# `mcp__radius__*`), so they pass through untouched.
 EXTENSION_ONLY_TOOLS = frozenset(
     {"contact_supervisor", "intercom", "bg_wait", "structured_output", "watchdog_diff", "subagent"}
 )
@@ -384,18 +390,41 @@ def pier_home() -> Path:
 
 
 def ensure_dir(p: Path) -> Path:
-    p.mkdir(parents=True, exist_ok=True)
+    """mkdir -p with 0700 on every directory pier creates: state, tasks and
+    replies belong to the caller's user only."""
+    missing: List[Path] = []
+    cur = p
+    while not cur.exists():
+        missing.append(cur)
+        cur = cur.parent
+    for d in reversed(missing):
+        d.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(p, 0o700)
     return p
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write a file only the user can read: tasks, replies, session state."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)  # O_CREAT's mode does not apply to an existing file
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
 
 
 def write_json(path: Path, data: Any) -> None:
     tmp = path.with_name(path.name + f".tmp{os.getpid()}.{threading.get_ident()}")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_private(tmp, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     os.replace(tmp, path)
 
 
 def read_json(path: Path) -> Dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise PierError(f"{path} is not valid JSON: {exc}") from None
+    if not isinstance(data, dict):
+        raise PierError(f"{path} does not hold a JSON object")
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -680,7 +709,6 @@ class RunSpec:
     thinking: Optional[str] = None
     tools: Optional[str] = None  # CSV for Pi; "" -> --no-tools
     exclude_tools: Optional[str] = None
-    extra: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)  # ignored-field notices etc.
 
 
@@ -722,10 +750,6 @@ def resolve_spec(spec: RunSpec) -> RunSpec:
             spec.provider = a.default_provider
     if spec.provider and not spec.model:
         raise PierError("--provider requires --model (Pi constraint)")
-    for x in spec.extra:
-        if x == "--api-key" or x.startswith("--api-key="):
-            raise PierError("--api-key is not accepted in --extra (it would be stored on disk); "
-                            "use the provider's environment variable")
     return spec
 
 
@@ -988,7 +1012,6 @@ def build_flags(spec: RunSpec) -> List[str]:
     # alone. The agent's own append comes first, the contract after.
     flags += ["--append-system-prompt", REPORT_CONTRACT]
     flags += resource_argv(spec)
-    flags += list(spec.extra)
     return flags
 
 
@@ -1006,7 +1029,7 @@ def prompt_args(prompt: str, prompt_file: Path, *, write: bool) -> List[str]:
         return ["--", prompt]
     # Too large for one argv element: Pi `@path` includes the file in the first prompt.
     if write:
-        prompt_file.write_text(prompt, encoding="utf-8")
+        write_private(prompt_file, prompt)
     return ["@" + str(prompt_file)]
 
 
@@ -1044,31 +1067,113 @@ def iter_sidecars(home: Path) -> List[Tuple[str, Dict[str, Any], float]]:
     for p in sessions_dir(home).glob("*.pier.json"):
         try:
             out.append((p.name[:-len(".pier.json")], read_json(p), p.stat().st_mtime))
-        except (PierError, OSError):
-            continue  # unreadable sidecar: not ours to diagnose mid-listing
+        except (PierError, OSError) as exc:
+            # Not ours to repair mid-listing, but the caller should know why a
+            # session disappeared from `ps` or from ref resolution.
+            print(f"pier: note: skipping session file {p.name}: {exc}", file=sys.stderr)
     return sorted(out, key=lambda t: t[2], reverse=True)
 
 
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def process_start(pid: int) -> Optional[str]:
+    """`ps` start time for a pid: tells our process apart from one that later
+    reused the same pid. None when ps cannot answer."""
+    try:
+        r = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="], capture_output=True,
+                           text=True, timeout=5, env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() or None
+
+
+def pid_owned_by(pid: int, started: Optional[str]) -> bool:
+    """True when `pid` is alive and is still the process recorded as `started`.
+    When ps cannot tell, assume it is ours: a false 'running' is recoverable, a
+    second concurrent turn on one session is not."""
+    if not pid_alive(pid):
+        return False
+    if not started:
+        return True
+    current = process_start(pid)
+    return current is None or current == started
+
+
+def running_pid(data: Dict[str, Any]) -> Optional[int]:
+    """The pid in a sidecar if that process is still the session's run."""
+    pid = data.get("pid")
+    if not isinstance(pid, int):
+        return None
+    return pid if pid_owned_by(pid, data.get("pid_start")) else None
+
+
+def ensure_not_running(ref: str, data: Dict[str, Any]) -> None:
+    pid = running_pid(data)
+    if pid is not None:
+        raise PierError(f"session {ref} is running (pid {pid}); wait for it to finish")
+
+
+def lock_holder(lock: Path) -> Optional[int]:
+    """The live pid recorded in a lock file, or None when it is stale."""
+    try:
+        lines = lock.read_text(encoding="utf-8").splitlines()
+        pid = int(lines[0].strip())
+    except (OSError, ValueError, IndexError):
+        return None
+    started = lines[1].strip() if len(lines) > 1 else None
+    return pid if pid_owned_by(pid, started) else None
+
+
+@contextlib.contextmanager
+def session_lock(home: Path, sid: str) -> Iterator[None]:
+    """Hold `<sid>.lock` for the duration: one `send` per session at a time. A
+    lock left by a killed pier is reclaimed once its pid is gone (or reused)."""
+    lock = sessions_dir(home) / f"{sid}.lock"
+    for _ in range(2):
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            holder = lock_holder(lock)
+            if holder is not None:
+                raise PierError(f"session {sid_to_ref(sid)} is already in use (pid {holder})") from None
+            lock.unlink(missing_ok=True)
+            continue
+        os.write(fd, f"{os.getpid()}\n{process_start(os.getpid()) or ''}\n".encode())
+        os.close(fd)
+        try:
+            yield
+        finally:
+            lock.unlink(missing_ok=True)
+        return
+    raise PierError(f"cannot lock session {sid_to_ref(sid)} ({lock})")
+
+
 def resolve_ref(home: Path, ref: str) -> str:
-    """A handle -> sid. Accepts the full uuid, an 8+-char unique prefix of one,
-    or a `--name` handle (newest wins)."""
+    """A handle -> sid. Priority: full uuid, then a `--name` handle (newest
+    wins), then a unique 8+-char prefix of a uuid."""
     if len(ref) == 36 and ref.count("-") == 4:
         load_sidecar(home, ref)  # raises the unknown-session error if absent
         return ref
     prefix_hits: List[str] = []
     name_hit: Optional[str] = None
     for sid, data, _ in iter_sidecars(home):  # newest mtime first
-        if sid.startswith(ref):
-            prefix_hits.append(sid)
         if (data.get("name") or "") == ref and name_hit is None:
             name_hit = sid  # same --name twice: newest wins
+        if sid.startswith(ref):
+            prefix_hits.append(sid)
+    if name_hit is not None:
+        return name_hit  # an explicit handle beats a coincidental uuid prefix
     if prefix_hits:
         if len(prefix_hits) > 1:
             alts = ", ".join(f"{sid_to_ref(s)}" for s in sorted(prefix_hits))
             raise PierError(f"ambiguous session {ref!r} (matches {alts}); use more chars")
         return prefix_hits[0]
-    if name_hit is not None:
-        return name_hit
     raise PierError(f"unknown session {ref!r}" + recent_refs_hint(home))
 
 
@@ -1082,7 +1187,12 @@ def recent_refs_hint(home: Path) -> str:
 
 
 def find_session_file(home: Path, sid: str) -> Optional[Path]:
-    hits = sorted(sessions_dir(home).rglob(f"*_{sid}.jsonl"))
+    """Pi's layout is <session-dir>/--<cwd>--/<time>_<sid>.jsonl; the flat
+    pattern is a fallback for a session dir written directly into."""
+    root = sessions_dir(home)
+    hits = sorted(root.glob(f"*/*_{sid}.jsonl"))
+    if not hits:
+        hits = sorted(root.glob(f"*_{sid}.jsonl"))
     return hits[0] if hits else None
 
 
@@ -1095,7 +1205,24 @@ class Turn:
     reply: str  # last non-empty assistant text since the last user message
     stop: Optional[str]  # stopReason of the last assistant message
     error: str  # its errorMessage
-    usage: Optional[Dict[str, Any]] = None  # its usage block, when Pi wrote one
+    usage: Optional[Dict[str, Any]] = None  # summed over the turn's assistant messages
+
+# Pi writes one non-cumulative usage block per assistant message (one per model
+# call), so a turn's cost is the sum, not the last block.
+USAGE_COUNTERS = ("input", "output", "cacheRead", "cacheWrite", "reasoning", "totalTokens")
+
+
+def add_usage(acc: Dict[str, Any], u: Dict[str, Any]) -> None:
+    for key in USAGE_COUNTERS:
+        v = u.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            acc[key] = acc.get(key, 0) + v
+    cost = u.get("cost")
+    if isinstance(cost, dict):
+        total = acc.setdefault("cost", {})
+        for key, v in cost.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                total[key] = total.get(key, 0) + v
 
 
 def last_turn(session_file: Path) -> Turn:
@@ -1115,7 +1242,9 @@ def last_turn(session_file: Path) -> Turn:
             turn.error = msg.get("errorMessage") or ""
             u = msg.get("usage")
             if isinstance(u, dict):
-                turn.usage = u
+                if turn.usage is None:
+                    turn.usage = {}
+                add_usage(turn.usage, u)
             text = _message_text(msg).strip()
             if text:
                 turn.reply = text
@@ -1149,12 +1278,30 @@ _children_lock = threading.RLock()
 _stopping = threading.Event()
 
 
+SIGTERM_GRACE_SECONDS = 5
+
+
 def _on_signal(signum: int, _frame: Any) -> None:
+    """Terminate Pi, wait briefly for it to exit, then kill it; a second signal
+    skips the grace period. Raising SystemExit unwinds through cmd_run's finally,
+    so the worktree is still cleaned up."""
+    already = _stopping.is_set()
     _stopping.set()
     with _children_lock:
-        for p in _children:
-            if p.poll() is None:
+        procs = list(_children)
+    for p in procs:
+        if p.poll() is None:
+            if already:
+                p.kill()
+            else:
                 p.terminate()
+    if not already:
+        deadline = time.monotonic() + SIGTERM_GRACE_SECONDS
+        for p in procs:
+            try:
+                p.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                p.kill()
     raise SystemExit(128 + signum)
 
 
@@ -1213,11 +1360,11 @@ def run_turn(home: Path, binary: str, sid: str, cwd: Path, flags: List[str],
     with tempfile.TemporaryDirectory(prefix="pier-") as tmp:
         argv = pi_argv(binary, home, flags, session_args,
                        prompt_args(prompt, Path(tmp) / "prompt.md", write=True))
-        patch_sidecar(home, sid, pid=os.getpid())
+        patch_sidecar(home, sid, pid=os.getpid(), pid_start=process_start(os.getpid()))
         try:
             code, err = run_pi(cwd, argv)
         finally:
-            patch_sidecar(home, sid, pid=None)
+            patch_sidecar(home, sid, pid=None, pid_start=None)
     sfile = find_session_file(home, sid)
     turn = last_turn(sfile) if sfile else Turn("", None, "")
     return turn_outcome(turn, code, err), turn
@@ -1228,7 +1375,12 @@ def patch_sidecar(home: Path, sid: str, **fields: Any) -> None:
     p = sidecar_path(home, sid)
     if not p.is_file():
         return  # a killed run between sidecar writes: nothing to patch
-    data = read_json(p)
+    try:
+        data = read_json(p)
+    except PierError as exc:
+        # Bookkeeping must not mask how the run itself ended.
+        print(f"pier: cannot update {sid_to_ref(sid)}: {exc}", file=sys.stderr)
+        return
     for k, v in fields.items():
         if v is None:
             data.pop(k, None)
@@ -1251,24 +1403,31 @@ def summary_line(ref: str, out: Outcome, turn: Optional[Turn], name: Optional[st
         if isinstance(cost, (int, float)):
             bits.append(f"${cost:.2f}")
     line = " · ".join(bits)
-    if out.error:
-        line += f" — {out.error}"
     return line
 
 
 def _fmt_tokens(n: int) -> str:
-    return f"{n // 1000}k" if n >= 1000 else str(n)
+    if n < 1000:
+        return str(n)
+    if n < 10_000:
+        return f"{n / 1000:.1f}k"
+    if n < 1_000_000:
+        return f"{n / 1000:.0f}k"
+    return f"{n / 1_000_000:.1f}M"
 
 
-def new_session(spec: RunSpec, home: Path, name: Optional[str]) -> Tuple[str, List[str]]:
-    """Mint a session id and persist its sidecar before Pi starts, so a killed
-    run can still be sent to or read back."""
-    flags = build_flags(spec)
-    sid = str(uuid.uuid4())
+def start_session(home: Path, sid: str, spec: RunSpec, flags: List[str],
+                  name: Optional[str], wt: Optional[Dict[str, str]]) -> None:
+    """Persist the sidecar before Pi starts, so a killed run can still be sent
+    to or read back. The recorded cwd is the directory Pi runs in: the worktree
+    when `wt` is set, so `send` keeps the same isolation."""
+    data: Dict[str, Any] = {"cwd": str(spec.cwd), "flags": flags,
+                            "name": name or spec.agent.name}
+    if wt:
+        data.update(worktree=wt["worktree"], start_head=wt["start_head"],
+                    origin_cwd=wt["origin_cwd"])
     ensure_dir(sessions_dir(home))
-    write_json(sidecar_path(home, sid),
-               {"cwd": str(spec.cwd), "flags": flags, "name": name or spec.agent.name})
-    return sid, flags
+    write_json(sidecar_path(home, sid), data)
 
 
 def print_dry_run(cwd: Path, notes: List[str], home: Path, flags: List[str],
@@ -1278,17 +1437,39 @@ def print_dry_run(cwd: Path, notes: List[str], home: Path, flags: List[str],
     binary = resolve_pi_binary(required=False)
     placeholder = Path(tempfile.gettempdir()) / "pier-XXXX" / "prompt.md"
     argv = pi_argv(binary, home, flags, session_args, prompt_args(prompt, placeholder, write=False))
-    print(f"cd {shlex.quote(str(cwd))} && {shlex.join(argv)}")
+    shown = " ".join(shlex.quote(_clip_for_dry_run(a)) for a in argv)
+    print(f"cd {shlex.quote(str(cwd))} && {shown}")
+
+
+def _clip_for_dry_run(arg: str) -> str:
+    if len(arg) <= DRY_RUN_ARG_CHARS:
+        return arg
+    return f"{arg[:DRY_RUN_ARG_CHARS]}…<{len(arg)} chars>"
 
 
 def spill_path(home: Path, sid: str) -> Path:
     return home / "out" / f"{sid}.md"
 
 
+def parse_max_chars(raw: str) -> int:
+    try:
+        n = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not an integer") from None
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be >= 0 (0 = print only the spill path)")
+    return n
+
+
 def max_chars_or_default() -> int:
     """--max-chars / PIER_MAX_CHARS budget, default 24k chars."""
-    raw = os.environ.get("PIER_MAX_CHARS")
-    return int(raw) if raw and raw.isdigit() else DEFAULT_MAX_CHARS
+    raw = (os.environ.get("PIER_MAX_CHARS") or "").strip()
+    if not raw:
+        return DEFAULT_MAX_CHARS
+    try:
+        return parse_max_chars(raw)
+    except argparse.ArgumentTypeError as exc:
+        raise PierError(f"PIER_MAX_CHARS: {exc}") from None
 
 
 def report(out: Outcome, home: Optional[Path] = None, sid: Optional[str] = None,
@@ -1298,13 +1479,14 @@ def report(out: Outcome, home: Optional[Path] = None, sid: Optional[str] = None,
     if out.reply and max_chars is not None and len(out.reply) > max_chars:
         ensure_dir(spill_path(home, sid).parent)
         path = spill_path(home, sid)
-        path.write_text(out.reply, encoding="utf-8")
+        write_private(path, out.reply)
         if max_chars > 0:
-            preview = out.reply[:PREVIEW_CHARS]
-            print(preview)
+            n = min(PREVIEW_CHARS, max_chars)
+            preview = out.reply[:n]
+            print(preview, end="")
             if not preview.endswith("\n"):
                 print()
-            print(f"[... {len(out.reply) - PREVIEW_CHARS} more chars; full reply: {path}]")
+            print(f"[... {len(out.reply) - n} more chars; full reply: {path}]")
         else:
             print(f"full reply: {path}")
     elif out.reply:
@@ -1331,13 +1513,24 @@ def emit(obj: Any) -> None:
     print(encode_toon(obj))
 
 
-def read_task(words: List[str]) -> str:
-    """Task text: the words, or stdin when no words are given (heredoc/pipe)."""
-    task = " ".join(words) if words else sys.stdin.read()
+def _clean_task(task: str) -> str:
     task = task.strip()
     if not task:
-        raise PierError("empty task (give task words, or pipe/heredoc stdin)")
+        raise PierError("empty task (give task words, a file, or pipe/heredoc stdin)")
     return task
+
+
+def read_task(words: List[str]) -> str:
+    """Task text: the words, or stdin when no words are given (heredoc/pipe)."""
+    if words:
+        return _clean_task(" ".join(words))
+    if sys.stdin.isatty():
+        raise PierError("no task given (pass task words, or --file PATH; stdin is a terminal)")
+    return _clean_task(sys.stdin.read())
+
+
+def read_task_file(path: Path) -> str:
+    return _clean_task(_read_text(path, "task file"))
 
 
 def spec_from_args(args: argparse.Namespace) -> RunSpec:
@@ -1353,11 +1546,17 @@ def spec_from_args(args: argparse.Namespace) -> RunSpec:
         raise PierError("missing AGENT (or --agent-file)")
     if args.no_tools and args.tools:
         raise PierError("--no-tools conflicts with --tools")
+    if args.file is not None:
+        if words:
+            raise PierError("--file cannot be combined with task words")
+        task = _clean_task(sys.stdin.read()) if args.file == "-" \
+            else read_task_file(Path(args.file).expanduser())
+    else:
+        task = read_task(words)
     return RunSpec(
-        cwd=cwd, task=read_task(words), agent=agent,
+        cwd=cwd, task=task, agent=agent,
         provider=args.provider, model=args.model, thinking=args.thinking,
         tools="" if args.no_tools else args.tools, exclude_tools=args.exclude_tools,
-        extra=list(args.extra or []),
     )
 
 
@@ -1365,76 +1564,128 @@ def cmd_run(args: argparse.Namespace) -> int:
     home = pier_home()
     spec = resolve_spec(spec_from_args(args))
     if args.dry_run:
-        print_dry_run(spec.cwd, spec.notes, home, build_flags(spec), ["--session-id", "<new-session-id>"],
-                      spec.task)
+        cwd = spec.cwd
+        notes = list(spec.notes)
+        if args.worktree:
+            cwd = home / "worktrees" / "<ref>"
+            notes.append(f"--worktree: Pi runs in {cwd}, a detached worktree of {spec.cwd} HEAD")
+        print_dry_run(cwd, notes, home, build_flags(spec),
+                      ["--session-id", "<new-session-id>"], spec.task)
         return 0
     binary = resolve_pi_binary()
-    sid, flags = new_session(spec, home, args.name)
+    flags = build_flags(spec)
+    sid = str(uuid.uuid4())
     ref = sid_to_ref(sid)
-    wt: Optional[Dict[str, str]] = None
-    if getattr(args, "worktree", False):
-        wt = make_worktree(home, ref, spec.cwd)
-        spec.cwd = Path(wt["worktree"])
-        patch_sidecar(home, sid, worktree=wt["worktree"], start_head=wt["start_head"])
-    print(f"pier: {ref} started ({spec.agent.name})", file=sys.stderr, flush=True)
-    out, turn = run_turn(home, binary, sid, spec.cwd, flags, ["--session-id", sid], spec.task)
+    wt = None
+    try:
+        if args.worktree:
+            wt = make_worktree(home, ref, spec.cwd)
+            spec.cwd = Path(wt["worktree"])
+        start_session(home, sid, spec, flags, args.name, wt)
+        print(f"pier: {ref} started ({spec.agent.name})", file=sys.stderr, flush=True)
+        out, turn = run_turn(home, binary, sid, spec.cwd, flags, ["--session-id", sid], spec.task)
+    finally:
+        # Before the summary: cleanup can print, and the last stderr line stays
+        # the summary with tokens and cost.
+        if wt:
+            cleanup_worktree(home, sid, ref, wt)
     print(summary_line(ref, out, turn, spec.agent.name), file=sys.stderr)
-    code = report(out, home, sid, args.max_chars)
-    if wt:
-        cleanup_worktree(home, ref, wt)  # clean+HEAD unmoved: auto-removed; dirty: path on stderr
-    return code
+    return report(out, home, sid, args.max_chars)
+
+
+def git_run(args: List[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess:
+    """Run git in `cwd`; a missing git or a timeout is a PierError."""
+    try:
+        return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PierError(f"git {args[0]} failed in {cwd}: {exc}") from None
 
 
 def make_worktree(home: Path, ref: str, cwd: Path) -> Dict[str, str]:
     """`git worktree add --detach $PIER_HOME/worktrees/<ref>`; a HEAD snapshot,
     without the caller's uncommitted changes (Claude Code isolation semantics)."""
     try:
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(cwd),
-                              capture_output=True, text=True, timeout=30).stdout.strip()
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise PierError(f"--worktree: cannot inspect {cwd}: {exc}") from None
-    if not head:
+        inside = git_run(["rev-parse", "--is-inside-work-tree"], cwd, 30)
+        head = git_run(["rev-parse", "HEAD"], cwd, 30)
+    except PierError as exc:
+        raise PierError(f"--worktree: {exc}") from None
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
         raise PierError(f"--worktree: {cwd} is not a git repository")
+    if head.returncode != 0:
+        raise PierError(f"--worktree: {cwd} has no commits to snapshot")
     wt = home / "worktrees" / ref
-    ensure_dir(wt.parent)
-    r = subprocess.run(["git", "worktree", "add", "--detach", str(wt), "HEAD"],
-                       cwd=str(cwd), capture_output=True, text=True, timeout=60)
+    try:
+        ensure_dir(wt.parent)
+        r = git_run(["worktree", "add", "--detach", str(wt), "HEAD"], cwd, 60)
+    except (PierError, OSError) as exc:
+        raise PierError(f"--worktree: {exc}") from None
     if r.returncode != 0:
         raise PierError(f"--worktree: git worktree add failed: {tail_text(r.stderr)}")
-    return {"worktree": str(wt), "start_head": head}
+    return {"worktree": str(wt), "start_head": head.stdout.strip(), "origin_cwd": str(cwd)}
 
 
-def cleanup_worktree(home: Path, ref: str, wt: Dict[str, str]) -> None:
-    """Auto-remove a pristine worktree; keep a dirty one and print its path."""
-    path = wt["worktree"]
-    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=str(path),
-                           capture_output=True, text=True, timeout=30).stdout.strip()
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(path),
-                          capture_output=True, text=True, timeout=30).stdout.strip()
+def cleanup_worktree(home: Path, sid: str, ref: str, wt: Dict[str, str]) -> None:
+    """Auto-remove a pristine worktree; keep a dirty one and print its path.
+    Cleanup never raises: it runs in a finally, including on SIGTERM."""
+    path = Path(wt["worktree"])
+    if not path.is_dir():
+        print(f"pier: {ref} worktree is gone; send runs in {wt['origin_cwd']}", file=sys.stderr)
+        restore_project_cwd(home, sid, wt)
+        return
+    try:
+        dirty = git_run(["status", "--porcelain"], path, 30).stdout.strip()
+        head = git_run(["rev-parse", "HEAD"], path, 30).stdout.strip()
+    except PierError as exc:
+        print(f"pier: {ref} kept worktree ({exc}): {path}", file=sys.stderr)
+        return
     if dirty or head != wt["start_head"]:
         print(f"pier: {ref} kept worktree (has changes): {path}", file=sys.stderr)
         return
-    r = subprocess.run(["git", "worktree", "remove", str(path)],
-                       cwd=str(path), capture_output=True, text=True, timeout=60)
+    try:
+        r = git_run(["worktree", "remove", str(path)], path, 60)
+    except PierError as exc:
+        print(f"pier: {ref} worktree remove failed ({exc}); kept: {path}", file=sys.stderr)
+        return
     if r.returncode != 0:
-        print(f"pier: {ref} worktree remove failed: {tail_text(r.stderr)}", file=sys.stderr)
+        print(f"pier: {ref} worktree remove failed: {tail_text(r.stderr)}; kept: {path}",
+              file=sys.stderr)
+        return
+    restore_project_cwd(home, sid, wt)
+
+
+def restore_project_cwd(home: Path, sid: str, wt: Dict[str, str]) -> None:
+    """Point the sidecar back at the project once its worktree is gone, so
+    `send` still has a directory to run in. `worktree` stays as the record of
+    where the run happened."""
+    try:
+        patch_sidecar(home, sid, cwd=wt["origin_cwd"])
+    except (PierError, OSError) as exc:
+        print(f"pier: cannot update {sid_to_ref(sid)} after worktree removal: {exc}",
+              file=sys.stderr)
 
 
 def cmd_send(args: argparse.Namespace) -> int:
     home = pier_home()
     sid = resolve_ref(home, args.session)
     side = load_sidecar(home, sid)
+    ref = sid_to_ref(sid)
     task = read_task(list(args.words))
     sfile = find_session_file(home, sid)
     if not sfile:
         raise PierError(f"session {args.session} has no Pi session file under {sessions_dir(home)}")
+    cwd = Path(side["cwd"])
+    if not cwd.is_dir():
+        raise PierError(f"session {ref} cwd is gone: {cwd} (run `pier ps {ref}` to inspect it)")
     session_args = ["--session", str(sfile)]
     if args.dry_run:
-        print_dry_run(Path(side["cwd"]), [], home, side["flags"], session_args, task)
+        print_dry_run(cwd, [], home, side["flags"], session_args, task)
         return 0
+    ensure_not_running(ref, side)
     binary = resolve_pi_binary()
-    ref = sid_to_ref(sid)
-    out, turn = run_turn(home, binary, sid, Path(side["cwd"]), side["flags"], session_args, task)
+    with session_lock(home, sid):
+        ensure_not_running(ref, load_sidecar(home, sid))  # a run may have started since
+        out, turn = run_turn(home, binary, sid, cwd, side["flags"], session_args, task)
     print(summary_line(ref, out, turn, side.get("name")), file=sys.stderr)
     return report(out, home, sid, args.max_chars)
 
@@ -1445,12 +1696,15 @@ def cmd_result(args: argparse.Namespace) -> int:
     sfile = find_session_file(home, sid)
     if not sfile:
         raise PierError(f"unknown session {args.session!r} (searched {sessions_dir(home)})")
-    turn = last_turn(sfile)
-    out = turn_outcome(turn, 0, "")
     ref = sid_to_ref(sid)
-    side = load_sidecar(home, sid)
-    print(summary_line(ref, out, turn, side.get("name")), file=sys.stderr)
-    return report(out, home, sid, args.max_chars)
+    ensure_not_running(ref, load_sidecar(home, sid))
+    with session_lock(home, sid):
+        side = load_sidecar(home, sid)
+        ensure_not_running(ref, side)
+        turn = last_turn(sfile)
+        out = turn_outcome(turn, 0, "")
+        print(summary_line(ref, out, turn, side.get("name")), file=sys.stderr)
+        return report(out, home, sid, args.max_chars)
 
 
 PS_LIMIT = 10
@@ -1461,12 +1715,10 @@ def session_row(home: Path, sid: str, data: Dict[str, Any], mtime: float) -> Dic
     pid = data.get("pid")
     sfile = find_session_file(home, sid)
     turn = last_turn(sfile) if sfile else None
-    if isinstance(pid, int):
-        try:
-            os.kill(pid, 0)
-            state = "running"
-        except OSError:
-            state = "failed"  # pid recorded but no longer alive: a killed run
+    if running_pid(data) is not None:
+        state = "running"
+    elif isinstance(pid, int):
+        state = "failed"  # pid recorded but no longer alive: a killed run
     elif turn and turn.stop not in FAILED_STOPS and turn.reply:
         state = "ok"
     elif turn:
@@ -1498,14 +1750,22 @@ def cmd_ps(args: argparse.Namespace) -> int:
         rows = [session_row(home, sid, load_sidecar(home, sid),
                             sidecar_path(home, sid).stat().st_mtime)]
     else:
-        cwd = str(Path(args.cwd or os.getcwd()).resolve())
+        project = Path(args.cwd).expanduser() if args.cwd else Path.cwd()
+        if not project.is_dir():
+            raise PierError(f"--cwd does not exist: {project}")
+        cwd = str(project.resolve())
         rows = []
+        total = 0
         for sid, data, mtime in iter_sidecars(home):
-            if len(rows) >= PS_LIMIT:
-                break
-            if data.get("cwd") != cwd:
+            # A --worktree session runs in its own checkout but belongs here.
+            if cwd not in (data.get("cwd"), data.get("origin_cwd")):
                 continue  # default view: this project's sessions only
-            rows.append(session_row(home, sid, data, mtime))
+            total += 1
+            if len(rows) < PS_LIMIT:
+                rows.append(session_row(home, sid, data, mtime))
+        if total > PS_LIMIT:
+            print(f"pier: note: showing {PS_LIMIT} of {total} sessions (newest first)",
+                  file=sys.stderr)
     if not rows:
         print("pier: no sessions (run one first)", file=sys.stderr)
         return 0
@@ -1514,7 +1774,23 @@ def cmd_ps(args: argparse.Namespace) -> int:
 
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+THINKING_ORDER = "off|minimal|low|medium|high|xhigh|max"
+THINKING_LEVELS = set(THINKING_ORDER.split("|"))
+
+
+def parse_thinking(raw: str) -> str:
+    level = raw.strip().lower()
+    if level not in THINKING_LEVELS:
+        raise argparse.ArgumentTypeError(f"must be one of {THINKING_ORDER}")
+    return level
+
+
+def parse_name(raw: str) -> str:
+    name = raw.strip()
+    if not NAME_RE.match(name):
+        raise argparse.ArgumentTypeError(
+            "letters, digits, . _ -; max 64; start with a letter or digit")
+    return name
 
 
 def validate_agent_text(text: str, name_hint: Optional[str] = None) -> Dict[str, Any]:
@@ -1538,6 +1814,15 @@ def validate_agent_text(text: str, name_hint: Optional[str] = None) -> Dict[str,
     th = (fm.get("thinking") or "").strip().lower()
     if th and th not in THINKING_LEVELS | {"false"}:
         errors.append(f"thinking {th!r} not one of {sorted(THINKING_LEVELS)}")
+    mode = (fm.get("systemPromptMode") or "").strip()
+    if mode and mode.lower() not in ("replace", "append"):
+        errors.append(f"systemPromptMode {mode!r} must be 'replace' or 'append'")
+    for key in ("inheritProjectContext", "inheritSkills"):
+        raw = (fm.get(key) or "").strip()
+        if raw and parse_bool(raw) is None:
+            errors.append(f"{key} {raw!r} is not a boolean (true/false)")
+    if (fm.get("defaultProvider") or "").strip() and not (fm.get("model") or "").strip():
+        warnings.append("defaultProvider has no effect without model")
     fields = classify_fields(fm)
     if fields["ignored"]:
         warnings.append("ignored frontmatter (not mapped, no effect): " + ", ".join(fields["ignored"]))
@@ -1600,9 +1885,17 @@ def add_task_args(p: argparse.ArgumentParser) -> None:
                    help="print the exact Pi command; runs nothing, writes nothing")
 
 
+class _Parser(argparse.ArgumentParser):
+    """No long-option abbreviations: `--hel` must not silently turn into help."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="pier", description="Run named Pi subagents from agent Markdown files. "
-                                "Every run is synchronous and prints only the reply on stdout.")
+    p = _Parser(prog="pier", description="Run named Pi subagents from agent Markdown files. "
+                 "Every run is synchronous and prints only the reply on stdout.")
     p.add_argument("--version", action="version", version=f"pier {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
 
@@ -1611,6 +1904,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "stderr: 'pier: <ref> started (<agent>)' then 'pier: <ref> ok · ...'.")
     sp.add_argument("words", nargs="*", metavar="AGENT TASK",
                     help="agent name, then the task as words; with --agent-file every word is task")
+    sp.add_argument("--file", metavar="PATH",
+                    help="read the task from this file ('-' = stdin); cannot be combined with task words")
     sp.add_argument("--agent-file", metavar="PATH", help="use this agent .md instead of AGENT "
                     "(frontmatter optional: a plain text file is just a role)")
     add_task_args(sp)
@@ -1618,20 +1913,19 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Pi working directory and project agent lookup root (default: current)")
     sp.add_argument("--provider", help="Pi --provider (requires --model)")
     sp.add_argument("--model", metavar="PROVIDER/ID", help="Pi --model; overrides frontmatter")
-    sp.add_argument("--thinking", metavar="LEVEL", help="Pi --thinking (off|minimal|low|medium|high|xhigh|max)")
+    sp.add_argument("--thinking", type=parse_thinking, metavar="LEVEL",
+                    help=f"Pi --thinking ({THINKING_ORDER})")
     sp.add_argument("--tools", metavar="CSV", help="Pi --tools allowlist; overrides frontmatter")
     sp.add_argument("--no-tools", action="store_true", help="Pi --no-tools")
     sp.add_argument("--exclude-tools", metavar="CSV", help="Pi --exclude-tools")
-    sp.add_argument("--name", metavar="HANDLE",
+    sp.add_argument("--name", type=parse_name, metavar="HANDLE",
                     help="session handle for send/result/ps (default: the agent name)")
-    sp.add_argument("--max-chars", type=int, default=max_chars_or_default(), metavar="N",
+    sp.add_argument("--max-chars", type=parse_max_chars, default=max_chars_or_default(), metavar="N",
                     help=f"stdout char budget for the reply; 0 = print only the spill path "
                          f"(env PIER_MAX_CHARS; default {DEFAULT_MAX_CHARS})")
     sp.add_argument("--worktree", action="store_true",
                     help="run Pi in a git worktree of HEAD (snapshot, no uncommitted changes); "
                          "clean at exit -> auto-removed, dirty -> kept and its path printed")
-    sp.add_argument("--extra", nargs=argparse.REMAINDER, default=[], metavar="PI_ARG",
-                    help="raw Pi args, passed through (must be last)")
 
     sp = sub.add_parser("send", help="send a follow-up to an existing session",
                         description="Continue a session with the same agent setup (system prompt, tools, "
@@ -1641,7 +1935,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("words", nargs="*", metavar="TASK",
                     help="follow-up message as words; with no words, read stdin (heredoc/pipe)")
     add_task_args(sp)
-    sp.add_argument("--max-chars", type=int, default=max_chars_or_default(), metavar="N",
+    sp.add_argument("--max-chars", type=parse_max_chars, default=max_chars_or_default(), metavar="N",
                     help=f"stdout char budget for the reply; 0 = print only the spill path "
                          f"(env PIER_MAX_CHARS; default {DEFAULT_MAX_CHARS})")
 
@@ -1649,7 +1943,7 @@ def build_parser() -> argparse.ArgumentParser:
                         description="Print the reply of a session's last turn; fails if that turn has none.")
     sp.add_argument("session", metavar="SESSION",
                     help="session: 8-char ref, --name handle, or full uuid from run")
-    sp.add_argument("--max-chars", type=int, default=max_chars_or_default(), metavar="N",
+    sp.add_argument("--max-chars", type=parse_max_chars, default=max_chars_or_default(), metavar="N",
                     help=f"stdout char budget for the reply; 0 = print only the spill path "
                          f"(env PIER_MAX_CHARS; default {DEFAULT_MAX_CHARS})")
 
@@ -1686,15 +1980,31 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-        signal.signal(sig, _on_signal)
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    # argparse reads a single-dash token longer than 2 chars as a cluster of
+    # short flags, so `-hello` becomes `-h` + `-e ...` and prints help, exit 0.
+    # pier has no short flags other than -h, so such a token is a task that
+    # starts with '-': it belongs after `--`, or in a --file.
+    for tok in args_list:
+        if tok == "--":
+            break
+        if len(tok) > 2 and tok.startswith("-") and not tok.startswith("--"):
+            print(f"pier: error: unrecognized option {tok!r} "
+                  "(a task that starts with '-' goes after '--', or use --file PATH)",
+                  file=sys.stderr)
+            return 2
     try:
+        args = build_parser().parse_args(args_list)
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(sig, _on_signal)
         return {"run": cmd_run, "send": cmd_send, "result": cmd_result,
                 "ps": cmd_ps, "agents": cmd_agents}[args.cmd](args)
     except PierError as exc:
         print(f"pier: error: {exc}", file=sys.stderr)
         return 2
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"pier: error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

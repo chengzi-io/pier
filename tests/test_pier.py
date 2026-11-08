@@ -2,7 +2,7 @@
 """Tests for pier. Uses mock/mock_pi only; never calls a model.
 
 Optional: PIER_TEST_REAL_PI=/path/to/pi runs an argv-parse check against a real
-Pi binary with an empty HOME and --offline (no credentials -> no model call).
+Pi binary with an empty HOME (no credentials -> no model call).
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import os
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -70,11 +71,7 @@ class Base(unittest.TestCase):
 
     def dry(self, *args, **kw):
         """Run with --dry-run and return the Pi argv parsed from `cd DIR && pi ...`."""
-        args = list(args)
-        if "--extra" in args:
-            args.insert(args.index("--extra"), "--dry-run")
-        else:
-            args.append("--dry-run")
+        args = list(args) + ["--dry-run"]
         r = self.pier(*args, **kw)
         self.assertEqual(r.returncode, 0, r.stderr)
         tokens = shlex.split(r.stdout)
@@ -90,6 +87,23 @@ class Base(unittest.TestCase):
 
     def state(self):
         return self.home / ".pier"
+
+    def sidecar_dir(self):
+        return self.state() / "sessions"
+
+    def wait_for_running_pid(self, timeout=10):
+        """Poll until a sidecar records a pid (a run or send is under way)."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            for p in self.sidecar_dir().glob("*.pier.json"):
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(data.get("pid"), int):
+                    return p.name[:-len(".pier.json")]
+            time.sleep(0.05)
+        self.fail("no session recorded a running pid")
 
     def sid_of(self, r, home=None):
         """Full sid from the run's stderr; the 8-char ref is `ref_of`."""
@@ -177,6 +191,27 @@ class LastTurnTests(unittest.TestCase):
         p = self.session({"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"},
                          {"role": "user", "content": "q2"})
         self.assertEqual(self.mod.last_turn(p).reply, "")
+
+    def test_usage_is_summed_over_the_turn(self):
+        # Pi writes one per-call usage block per assistant message; a turn with
+        # tool calls has several. Each is non-cumulative.
+        def am(u):
+            return {"role": "assistant", "content": [{"type": "text", "text": "x"}], "usage": u}
+        blocks = [
+            {"input": 10, "output": 2, "cacheRead": 100, "cacheWrite": 0, "reasoning": 1,
+             "totalTokens": 112, "cost": {"input": 0.1, "output": 0.2, "total": 0.3}},
+            {"input": 20, "output": 3, "cacheRead": 200, "cacheWrite": 0, "reasoning": 2,
+             "totalTokens": 223, "cost": {"input": 0.4, "output": 0.5, "total": 0.9}},
+            {"input": 30, "output": 4, "cacheRead": 300, "cacheWrite": 0, "reasoning": 3,
+             "totalTokens": 334, "cost": {"input": 0.6, "output": 0.7, "total": 1.3}},
+        ]
+        p = self.session({"role": "user", "content": "q"}, *[am(u) for u in blocks])
+        usage = self.mod.last_turn(p).usage
+        self.assertEqual(usage["input"], 60)
+        self.assertEqual(usage["output"], 9)
+        self.assertEqual(usage["cacheRead"], 600)
+        self.assertEqual(usage["totalTokens"], 669)
+        self.assertAlmostEqual(usage["cost"]["total"], 2.5)
 
     def test_failed_stop_reason_beats_exit_zero_and_earlier_text(self):
         # JSON-mode Pi exits 0 on provider errors; the session entry is authoritative.
@@ -274,6 +309,15 @@ class MappingTests(Base):
         lines = r.stderr.splitlines()
         self.assertTrue(lines[1].startswith("pier: ") and " ok (e)" in lines[1], r.stderr)
 
+    def test_mcp_tools_and_globs_pass_through(self):
+        # Pi names MCP tools `mcp__<server>__<tool>`; `*` is a Pi tool pattern.
+        self.write_agent(".pier/agents/m.md",
+                         "---\nname: m\ntools: read, mcp__radius__search, mcp__radius__*\n---\nB\n")
+        a = self.dry("run", "m", "go")
+        self.assertEqual(flag(a, "--tools"), "read,mcp__radius__search,mcp__radius__*")
+        a = self.dry("run", "m", "go", "--exclude-tools", "mcp__*")
+        self.assertEqual(flag(a, "--exclude-tools"), "mcp__*")
+
     def test_prompt_is_task_and_body_is_system_prompt(self):
         self.write_agent(".pier/agents/c.md", "---\nname: c\n---\n\nROLE LINE\n\nSecond para.\n\n")
         a = self.dry("run", "c", "DO THE THING")
@@ -284,11 +328,10 @@ class MappingTests(Base):
         task = "it's \"quoted\" $HOME `x` 中文 ✓"
         self.assertEqual(self.dry("run", "reviewer", task)[-1], task)
 
-    def test_api_key_in_extra_rejected(self):
-        r = self.pier("run", "reviewer", "x", "--extra", "--api-key", "SECRET")
+    def test_extra_option_is_gone(self):
+        r = self.pier("run", "reviewer", "x", "--extra", "--offline")
         self.assertEqual(r.returncode, 2)
-        self.assertIn("environment", r.stderr)
-        self.assertNotIn("SECRET", r.stderr)
+        self.assertIn("unrecognized arguments", r.stderr)
         self.assertFalse(self.state().exists())
 
     def test_large_prompt_uses_temp_file(self):
@@ -312,6 +355,30 @@ class InputModesTests(Base):
         r = self.pier("run", "reviewer", "WORDS", input_text="leak")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.argv()[-1], "WORDS")
+
+    def test_task_from_file(self):
+        p = self.tmp / "task.md"
+        p.write_text("from a file\n", encoding="utf-8")
+        r = self.pier("run", "reviewer", "--file", str(p))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.argv()[-1], "from a file")
+        r = self.pier("run", "reviewer", "--file", "-", input_text="from stdin\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.argv()[-1], "from stdin")
+
+    def test_task_file_missing_is_an_error(self):
+        r = self.pier("run", "reviewer", "--file", str(self.tmp / "nope.md"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("cannot read task file", r.stderr)
+
+    def test_dash_task_needs_separator(self):
+        r = self.pier("run", "reviewer", "-hello")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("after '--'", r.stderr)
+        r = self.pier("run", "reviewer", "--", "-hello")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.argv()[-1], "-hello")
 
     def test_empty_stdin_rejected(self):
         r = self.pier("run", "reviewer", input_text="  \n")
@@ -350,6 +417,16 @@ class AgentAuthoringTests(Base):
         self.assertEqual(r.returncode, 1)
         self.assertIn("errors[3]:", r.stdout)
         self.assertIn("no effect", r.stdout)
+
+    def test_validate_rejects_bad_enum_and_booleans(self):
+        p = self.tmp / "x.md"
+        p.write_text("---\nname: x\ndescription: d\nsystemPromptMode: prepend\n"
+                     "inheritSkills: maybe\ndefaultProvider: anthropic\n---\nROLE\n")
+        r = self.pier("agents", "validate", str(p))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("systemPromptMode", r.stdout)
+        self.assertIn("inheritSkills", r.stdout)
+        self.assertIn("defaultProvider has no effect without model", r.stdout)
 
     def test_new_default_project_path(self):
         p = self.tmp / "def.md"
@@ -432,6 +509,17 @@ class SessionTests(Base):
         r = self.pier("result", sid, "--max-chars", "100000")
         self.assertEqual(r.stdout, reply + "\n")  # a large budget inlines it all
 
+    def test_small_budget_caps_the_preview(self):
+        # budget < reply < PREVIEW_CHARS used to print the whole reply and a
+        # negative "more chars" count.
+        reply = "C" * 1_500
+        r = self.pier("run", "reviewer", "x", "--max-chars", "1000", env={"MOCK_PI_REPLY": reply})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = r.stdout.splitlines()
+        self.assertEqual(lines[0], "C" * 1_000)
+        self.assertRegex(lines[-1], r"\[\.\.\. 500 more chars; full reply: .+\]$")
+        self.assertNotIn("more chars: -", r.stdout)
+
     def test_max_chars_env_default_and_failure_keeps_path_last(self):
         reply = "B" * 30_000
         r = self.pier("run", "reviewer", "x", env={"MOCK_PI_REPLY": reply, "PIER_MAX_CHARS": "5000"})
@@ -486,12 +574,13 @@ class SessionTests(Base):
         ref = self.ref_of(r)
         self.assertEqual(r.stderr.splitlines(),
                          [f"pier: {ref} started (reviewer)",
-                          f"pier: {ref} ok (reviewer) · 1k tok · $0.01"])
+                          f"pier: {ref} ok (reviewer) · 1.8k tok · $0.01"])
         r = self.pier("run", "reviewer", "x", env={"MOCK_PI_FAIL": "1"})
         ref = self.ref_of(r)
         line = r.stderr.splitlines()[1]
         self.assertTrue(line.startswith(f"pier: {ref} failed (reviewer)"), r.stderr)
-        self.assertIn(" — ", line)  # the failure reason is appended
+        self.assertNotIn(" — ", line)  # the reason is reported once, below
+        self.assertEqual(r.stderr.count("pier: error:"), 1, r.stderr)
 
     def test_send_resolves_prefix_name_and_errors_on_ambiguity(self):
         sid = self.sid_of(self.pier("run", "reviewer", "first"))
@@ -525,6 +614,154 @@ class SessionTests(Base):
         r = self.pier("result", sid)
         self.assertEqual(r.returncode, 1)  # never hands back the stale first reply
         self.assertIn("no reply after the last prompt", r.stderr)
+
+    def test_send_and_result_refuse_a_running_session(self):
+        slow = subprocess.Popen([sys.executable, str(PIER), "run", "reviewer", "slow"],
+                                cwd=str(self.proj), env=self.full_env({"MOCK_PI_SLEEP": "30"}),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        try:
+            sid = self.wait_for_running_pid()
+            for cmd in ("send", "result"):
+                r = self.pier(cmd, sid, *(["x"] if cmd == "send" else []))
+                self.assertEqual(r.returncode, 2, f"{cmd}: {r.stderr}")
+                self.assertIn("is running", r.stderr, cmd)
+        finally:
+            slow.send_signal(signal.SIGTERM)
+            self.assertEqual(slow.wait(timeout=10), 128 + signal.SIGTERM)
+            slow.stdout.close()
+            slow.stderr.close()
+
+    def test_second_send_is_refused_and_lock_is_released(self):
+        sid = self.sid_of(self.pier("run", "reviewer", "first"))
+        slow = subprocess.Popen([sys.executable, str(PIER), "send", sid, "slow"],
+                                cwd=str(self.proj), env=self.full_env({"MOCK_PI_SLEEP": "30"}),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        try:
+            self.wait_for_running_pid()
+            r = self.pier("send", sid, "again")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("is running", r.stderr)
+        finally:
+            slow.send_signal(signal.SIGTERM)
+            self.assertEqual(slow.wait(timeout=10), 128 + signal.SIGTERM)
+            slow.stdout.close()
+            slow.stderr.close()
+        self.assertFalse((self.sidecar_dir() / f"{sid}.lock").exists())
+
+    def test_stale_lock_is_reclaimed(self):
+        sid = self.sid_of(self.pier("run", "reviewer", "first"))
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        lock = self.sidecar_dir() / f"{sid}.lock"
+        lock.write_text(str(dead.pid), encoding="utf-8")
+        r = self.pier("send", sid, "after a crash")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_stale_lock_with_a_reused_pid_is_reclaimed(self):
+        sid = self.sid_of(self.pier("run", "reviewer", "first"))
+        decoy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            lock = self.sidecar_dir() / f"{sid}.lock"
+            lock.write_text(f"{decoy.pid}\nThu Jan  1 00:00:00 1970\n", encoding="utf-8")
+            r = self.pier("send", sid, "x")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse(lock.exists())
+        finally:
+            decoy.terminate()
+            decoy.wait(timeout=10)
+
+    def test_a_reused_pid_does_not_block_the_session(self):
+        sid = self.sid_of(self.pier("run", "reviewer", "first"))
+        decoy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            side_path = self.sidecar_dir() / f"{sid}.pier.json"
+            side = json.loads(side_path.read_text(encoding="utf-8"))
+            side.update(pid=decoy.pid, pid_start="Thu Jan  1 00:00:00 1970")
+            side_path.write_text(json.dumps(side), encoding="utf-8")
+            r = self.pier("ps")
+            self.assertNotIn("running", r.stdout)  # the pid is someone else's now
+            r = self.pier("send", sid, "continue")
+            self.assertEqual(r.returncode, 0, r.stderr)
+        finally:
+            decoy.terminate()
+            decoy.wait(timeout=10)
+
+    def test_ref_prefers_an_exact_name_over_a_uuid_prefix(self):
+        self.sidecar_dir().mkdir(parents=True, exist_ok=True)
+        for sid, name in [("aaaa1111-1111-1111-1111-111111111111", "other"),
+                          ("aaaa2222-2222-2222-2222-222222222222", "aaaa")]:
+            (self.sidecar_dir() / f"{sid}.pier.json").write_text(
+                json.dumps({"cwd": str(self.proj.resolve()), "flags": [], "name": name}),
+                encoding="utf-8")
+        r = self.pier("ps", "aaaa")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("aaaa2222", r.stdout)  # the --name handle wins
+        self.assertNotIn("aaaa1111", r.stdout)
+
+    def test_cli_thinking_and_name_are_validated(self):
+        r = self.pier("run", "reviewer", "x", "--thinking", "ultra")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("off|minimal|low|medium|high|xhigh|max", r.stderr)
+        r = self.pier("run", "reviewer", "x", "--name", "bad name")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("letters, digits", r.stderr)
+        a = self.dry("run", "reviewer", "x", "--thinking", "HIGH")
+        self.assertEqual(flag(a, "--thinking"), "high")
+
+    def test_corrupt_sidecar_is_skipped_not_fatal(self):
+        sid = self.sid_of(self.pier("run", "reviewer", "hello"))
+        bad = self.sidecar_dir() / "0badc0de-0000-0000-0000-000000000000.pier.json"
+        bad.write_text("{not json", encoding="utf-8")
+        r = self.pier("ps")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("skipping session file", r.stderr)
+        self.assertIn(sid[:8], r.stdout)  # the healthy session still lists
+        r = self.pier("send", "0badc0de", "x")  # skipped, so unknown rather than a traceback
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unknown session", r.stderr)
+
+    def test_state_and_reply_files_are_user_only(self):
+        r = self.pier("run", "reviewer", "x", env={"MOCK_PI_REPLY": "P" * 30_000})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        sid = self.sid_of(r)
+        for d in (self.state(), self.state() / "sessions", self.state() / "out"):
+            self.assertEqual(stat.S_IMODE(d.stat().st_mode), 0o700, d)
+        for f in (self.state() / "sessions" / f"{sid}.pier.json",
+                  self.state() / "out" / f"{sid}.md"):
+            self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600, f)
+
+    def test_negative_max_chars_is_rejected(self):
+        r = self.pier("run", "reviewer", "x", "--max-chars", "-1")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("must be >= 0", r.stderr)
+        self.assertEqual(self.calls(), [])
+        r = self.pier("run", "reviewer", "x", env={"PIER_MAX_CHARS": "-1"})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("PIER_MAX_CHARS", r.stderr)
+
+    def test_dry_run_clips_long_task(self):
+        r = self.pier("run", "reviewer", "word " * 4000, "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLess(len(r.stdout), 2000)
+        self.assertRegex(r.stdout, r"…<\d+ chars>")
+
+    def test_ps_rejects_missing_cwd(self):
+        r = self.pier("ps", "--cwd", str(self.tmp / "nope"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--cwd does not exist", r.stderr)
+
+    def test_ps_notes_the_limit(self):
+        for i in range(12):
+            self.sidecar_dir().mkdir(parents=True, exist_ok=True)
+            (self.sidecar_dir() / f"00000000-0000-0000-0000-{i:012d}.pier.json").write_text(
+                json.dumps({"cwd": str(self.proj.resolve()), "flags": [], "name": "a"}),
+                encoding="utf-8")
+        r = self.pier("ps")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("showing 10 of 12 sessions", r.stderr)
 
     def test_killed_pier_stops_pi_and_session_survives(self):
         p = subprocess.Popen([sys.executable, str(PIER), "run", "reviewer", "slow"], cwd=str(self.proj),
@@ -661,8 +898,59 @@ class WorktreeTests(Base):
         self.assertIn("kept worktree", stderr)
         self.assertIn(str(wt), stderr)
         self.assertTrue(wt.is_dir())
+        # cleanup runs before the summary, so the last stderr line keeps tokens + cost
+        self.assertRegex(stderr.splitlines()[-1], r"^pier: \w+ ok \(reviewer\) · ")
+        # a worktree session still belongs to this project in `ps`
+        self.assertIn(stderr.split()[1], self.pier("ps").stdout)
         # pier does not touch the caller's checkout
         self.assertEqual((self.proj / "f.txt").read_text(), "base\n")
+
+    def test_send_runs_in_the_kept_worktree(self):
+        wt, stderr = self.run_with_worktree_mutation(
+            lambda w: (w / "f.txt").write_text("edited\n", encoding="utf-8"))
+        ref = stderr.split()[1]
+        cwd_rec = self.tmp / "pi-cwd"
+        r = self.pier("send", ref, "continue", env={"MOCK_PI_RECORD_CWD": str(cwd_rec)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(Path(cwd_rec.read_text(encoding="utf-8")).resolve(), wt.resolve())
+
+    def test_send_after_the_worktree_is_removed_runs_in_the_project(self):
+        r = self.pier("run", "reviewer", "hello", "--worktree")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        sid = self.sid_of(r)
+        side = json.loads((self.state() / "sessions" / f"{sid}.pier.json").read_text())
+        self.assertEqual(Path(side["cwd"]).resolve(), self.proj.resolve())  # restored
+        cwd_rec = self.tmp / "pi-cwd"
+        r = self.pier("send", sid, "continue", env={"MOCK_PI_RECORD_CWD": str(cwd_rec)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(Path(cwd_rec.read_text(encoding="utf-8")).resolve(), self.proj.resolve())
+
+    def test_sigterm_removes_a_clean_worktree(self):
+        slow = subprocess.Popen([sys.executable, str(PIER), "run", "reviewer", "x", "--worktree"],
+                                cwd=str(self.proj), env=self.full_env({"MOCK_PI_SLEEP": "30"}),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        wt = None
+        try:
+            wtdir = self.state() / "worktrees"
+            for _ in range(200):
+                if wtdir.is_dir() and any(wtdir.iterdir()):
+                    wt = next(wtdir.iterdir())
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(wt, "worktree never appeared")
+            self.wait_for_running_pid()  # Pi is up, so the run's finally will fire
+            slow.send_signal(signal.SIGTERM)
+            self.assertEqual(slow.wait(timeout=10), 128 + signal.SIGTERM)
+        finally:
+            if slow.poll() is None:
+                slow.terminate()
+                slow.wait(timeout=10)
+        stderr = slow.stderr.read()
+        slow.stdout.close()
+        slow.stderr.close()
+        self.assertFalse(wt.exists(), stderr)  # clean snapshot removed on the way out
+        self.assertNotIn("kept worktree", stderr)
 
     def test_head_moved_worktree_is_kept(self):
         # a commit inside the worktree counts as a change even with clean status
@@ -677,6 +965,21 @@ class WorktreeTests(Base):
         r = self.pier("run", "reviewer", "x", "--worktree", cwd=bare)
         self.assertEqual(r.returncode, 2)
         self.assertIn("not a git repository", r.stderr)
+        self.assertFalse((self.state() / "sessions").exists())  # no session left behind
+
+    def test_worktree_in_repo_without_commits_errors(self):
+        empty = self.tmp / "empty repo"
+        empty.mkdir()
+        self.git("init", "-q", cwd=empty)
+        r = self.pier("run", "reviewer", "x", "--worktree", cwd=empty)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("no commits to snapshot", r.stderr)
+
+    def test_dry_run_with_worktree_shows_the_worktree_cwd(self):
+        r = self.pier("run", "reviewer", "x", "--worktree", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(str(self.state() / "worktrees" / "<ref>"), r.stdout)
+        self.assertIn("detached worktree of", r.stderr)
 
 
 class StorageTests(Base):
@@ -697,6 +1000,15 @@ class StorageTests(Base):
         sid = self.sid_of(self.pier("run", "reviewer", "x", env={"PIER_HOME": str(alt)}), home=alt)
         self.assertTrue((alt / "sessions" / f"{sid}.pier.json").exists())
         self.assertFalse(self.state().exists())
+
+
+class FormatTests(unittest.TestCase):
+    def test_fmt_tokens_rounds(self):
+        m = load_mod()
+        self.assertEqual(m._fmt_tokens(999), "999")
+        self.assertEqual(m._fmt_tokens(1_801), "1.8k")
+        self.assertEqual(m._fmt_tokens(12_345), "12k")
+        self.assertEqual(m._fmt_tokens(1_234_567), "1.2M")
 
 
 class ToonEncodeTests(unittest.TestCase):
@@ -924,7 +1236,7 @@ class RealPiArgvTests(Base):
                          "tools: read, grep\nexcludeTools: bash\n---\nRole \"q\" 中文\n")
         clean = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", ""), "PI_BIN": real,
                  "PI_CODING_AGENT_DIR": str(self.tmp / "pi-agent"), "PIER_HOME": str(self.tmp / "pier-home")}
-        r = subprocess.run([sys.executable, str(PIER), "run", "r", "task it's 中文", "--extra", "--offline"],
+        r = subprocess.run([sys.executable, str(PIER), "run", "r", "task it's 中文"],
                            cwd=str(self.proj), env=clean, stdin=subprocess.DEVNULL,
                            capture_output=True, text=True, timeout=60)
         self.assertNotIn("Unknown option", r.stderr)

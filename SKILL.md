@@ -38,8 +38,8 @@ pier ps                                          # recent sessions of this cwd (
 ```
 
 Options: `--cwd DIR --model provider/id --thinking LEVEL --tools a,b | --no-tools
---exclude-tools a,b --name HANDLE --max-chars N --dry-run --extra <raw pi args, last>`.
-CLI flags override frontmatter.
+--exclude-tools a,b --name HANDLE --file PATH --max-chars N --dry-run`.
+CLI flags override frontmatter. A task starting with `-` goes after `--` (or in `--file`).
 
 - stdout = the reply only. stderr line 1 = `pier: <ref> started (<agent>)`; keep the
   8-char ref (or a `--name` handle) for `send`. The last stderr line has tokens + cost.
@@ -52,7 +52,10 @@ CLI flags override frontmatter.
   (Claude Code: Bash `run_in_background: true`), use it for runs that may outlast the
   foreground timeout; you are notified when it ends, so do not poll. If the host kills
   pier, Pi stops too: `pier send <ref> "continue"`. With `--worktree`, a clean
-  worktree is auto-removed at exit; a changed one is kept and its path printed on stderr.
+  worktree is auto-removed at exit; a changed one is kept and its path printed on stderr,
+  and `send` continues in it (or in the project once it is gone).
+- `send`/`result` refuse a session while its turn is running (exit 2); `send` is
+  serialized per session.
 
 ## Agent files
 

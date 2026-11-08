@@ -79,15 +79,15 @@ listing. Hosts that do not expand that line must run that absolute path once ins
 
 `run` options: `--cwd DIR`, `--model PROVIDER/ID`, `--provider`, `--thinking LEVEL`,
 `--tools CSV` or `--no-tools`, `--exclude-tools CSV`, `--name HANDLE`, `--worktree`,
-`--max-chars N`, `--dry-run`, and `--extra ...` (raw Pi arguments, must be last;
-`--api-key` is rejected because flags are stored on disk). Command-line values override
-frontmatter. `pier <command> -h` documents every argument.
+`--file PATH`, `--max-chars N`, `--dry-run`. Command-line values override frontmatter.
+A task that starts with `-` goes after `--`. `pier <command> -h` documents every argument.
 
 ### Handles
 
 `run` prints an 8-char ref on stderr; the full session uuid and a `--name` handle
-(newest wins on repeats) resolve everywhere a session is taken. An unknown ref errors with
-a hint of the five most recent sessions, so the caller recovers without a second tool call.
+(newest wins on repeats) resolve everywhere a session is taken, in that order before a
+unique uuid prefix. An unknown ref errors with a hint of the five most recent sessions, so
+the caller recovers without a second tool call.
 
 ### Output and exit codes
 
@@ -97,21 +97,25 @@ a hint of the five most recent sessions, so the caller recovers without a second
 | Model error or abort | — | `pier: error: model run error: …` | Pi's code, else 1 |
 | Reply cut off at the token limit | partial reply + `pier: error: … (continue it: pier send <ref> "continue")` | Pi's code, else 1 |
 | Pi exited non-zero | — | `pier: error: pi exited N: <stderr tail>` | N |
+| Session busy: its turn is still running, or another `send` holds it | — | `pier: error: session <ref> is running/is already in use …` | 2 |
 | Invalid arguments, unknown agent or session, Pi not found | — | `pier: error: …` | 2 |
 
 The started line is printed before Pi starts, so the ref survives a killed run. The final
 stderr line carries tokens and cost from the session's usage, so the caller gets the price
 without another tool call. `--dry-run` prints `cd <cwd> && pi …` and runs and writes
-nothing. `agents list`, `ps`, `paths`, `validate` and `new` print
-[TOON](https://github.com/toon-format/spec).
+nothing; values longer than 400 chars (task, system prompt) are clipped and shown with
+their full length, and with `--worktree` the printed `cd` is the worktree placeholder
+(`$PIER_HOME/worktrees/<ref>`) with a note naming the project it snapshots. `agents list`,
+`ps`, `paths`, `validate` and `new` print [TOON](https://github.com/toon-format/spec).
 
 ### Output budget
 
-stdout is capped at `--max-chars` (default 24,000, env `PIER_MAX_CHARS`; `0` = path only).
-An over-budget reply is previewed (first 2k chars) and spilled byte-identical to
-`$PIER_HOME/out/<sid>.md`; stdout's last line is the path, so the caller reads the file
-directly instead of re-running with a bigger budget. `pier send <ref> "continue"` extends a
-reply cut off at the model's output token limit.
+The reply is capped at `--max-chars` (default 24,000, env `PIER_MAX_CHARS`; `0` = path only;
+a negative value is an error).
+An over-budget reply is previewed (at most `min(2000, max-chars)` chars) and spilled
+byte-identical to `$PIER_HOME/out/<sid>.md`; stdout's last line is the path, so the caller
+reads the file directly instead of re-running with a bigger budget. `pier send <ref>
+"continue"` extends a reply cut off at the model's output token limit.
 
 ### Long runs
 
@@ -128,9 +132,15 @@ finishes.
 ### Isolation: `--worktree`
 
 `pier run --worktree` gives the session a fresh `git worktree` of the caller's `HEAD`
-(detached, so uncommitted changes are not inherited). At exit, a pristine worktree
-(unmoved `HEAD`, clean `git status`) is removed automatically; anything else is kept and
-its path printed on stderr, so the caller can diff or commit the agent's changes.
+(detached, so uncommitted changes are not inherited). The worktree is created before the
+session is recorded, and it is the directory Pi runs in, so `send` continues there. At
+exit, including when pier is terminated, a pristine worktree (unmoved `HEAD`, clean
+`git status`) is removed automatically; anything else is kept and its path printed on
+stderr, so the caller can diff or commit the agent's changes. Once the worktree is
+removed, `send` runs in the project directory again. `pier ps` lists a worktree session
+under its project, not under the worktree path.
+`send` and `result` refuse a session while its turn is running, and one `send` per session
+at a time (a lock left by a killed pier is reclaimed when its pid is gone).
 
 ## Agent files
 
@@ -189,7 +199,8 @@ pier writes only these:
 
 | Path | Content | When |
 |---|---|---|
-| `$PIER_HOME/sessions/<sid>.pier.json` | cwd, flags, name, pid, worktree of the run | before Pi starts |
+| `$PIER_HOME/sessions/<sid>.pier.json` | cwd, flags, name, pid + its start time, worktree of the run | before Pi starts |
+| `$PIER_HOME/sessions/<sid>.lock` | pid of the `send` that holds the session | while `send` runs |
 | `$PIER_HOME/sessions/--<cwd>--/<time>_<sid>.jsonl` | Pi's own session file | while Pi runs |
 | `$PIER_HOME/out/<sid>.md` | over-budget reply, byte-identical | spill on `--max-chars` |
 | `$PIER_HOME/worktrees/<ref>/` | `--worktree` checkout | while the session runs; kept when dirty |
@@ -201,6 +212,10 @@ and Pi's skill locations when resolving `skills:` names
 (`<cwd>/.pi/skills`, `<cwd>/.agents/skills`, `pi.skills` in `package.json` files,
 `.pi/settings.json`, `~/.pi/agent/skills`, `~/.agents/skills`, `~/.pi/agent/settings.json`).
 Pi itself reads and writes project files according to the agent's tools.
+
+Directories pier creates are `0700`; the sidecars, spilled replies and task files are
+`0600`. A sidecar that is not valid JSON is skipped with a `pier: note:` line instead of
+breaking `ps` or ref resolution.
 
 Old files under `$PIER_HOME` can be removed whenever their sessions are done.
 
