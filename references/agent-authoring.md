@@ -36,7 +36,7 @@ Output:
 | `tools` | `--tools` CSV | Pi tool names. Empty = `--no-tools`. MCP tools (`mcp__<server>__<tool>` or `mcp__<server>__*`) pass through; extension-only names are dropped |
 | `excludeTools` | `--exclude-tools` CSV | |
 | `systemPromptMode` | `--system-prompt` / `--append-system-prompt` | `replace` (default) or `append` |
-| `skills` / `skill` | repeated `--skill <path>` | Names resolved from Pi's project, package, settings and user skill locations. Empty list or `inheritSkills: false` = `--no-skills`. An unknown name is an error |
+| `skills` / `skill` | repeated `--skill <resolved path>` | Names resolved from Pi's project, package, settings and user skill locations. Empty list or `inheritSkills: false` = `--no-skills`. An unknown name is an error |
 | `skillPath` | repeated `--skill <path>` | Relative to the agent file's directory; absolute paths as is |
 | `extensions` | `--no-extensions` + repeated `--extension` | Empty list = only `--no-extensions`. Relative paths resolve against the agent file; `builtin:` `npm:` `git:` `http(s):` `file:` and absolute paths pass through |
 | `subagentOnlyExtensions` | joins the `--extension` allowlist | Same rules as `extensions` |
@@ -79,4 +79,3 @@ pier agents new sql-reviewer --file /tmp/sql-reviewer.md --user   # $PIER_HOME/a
   the `inheritProjectContext` / `inheritSkills` booleans, and tool names; it warns about
   fields with no effect (including `defaultProvider` without a `model`).
 - Do not write into this skill's `agents/` (examples; updates overwrite them).
-- Do not write into pi-subagents directories; use `--dir` only for a path the user names.
