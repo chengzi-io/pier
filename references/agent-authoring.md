@@ -33,10 +33,10 @@ Output:
 | `model` | `--model` verbatim | e.g. `anthropic/claude-sonnet-4-5`, `provider/id:low`. `inherit` or empty = omitted |
 | `thinking` | `--thinking` | `off` `minimal` `low` `medium` `high` `xhigh` `max`. A `:level` suffix on `model` wins |
 | `defaultProvider` | `--provider` | Only when `model` has no `provider/` prefix |
-| `tools` | `--tools` CSV | Pi tool names. Empty = `--no-tools`. MCP tools (`mcp__<server>__<tool>` or `mcp__<server>__*`) pass through; extension-only names are dropped |
+| `tools` | `--tools` CSV | Strict allowlist of Pi tool names. Empty = `--no-tools`. No `mcp__` entry = also `--no-mcp` (Pi keeps every MCP tool otherwise); list MCP tools as `mcp__<server>__<tool>` or `mcp__<server>__*`. Extension-only names are dropped |
 | `excludeTools` | `--exclude-tools` CSV | |
 | `systemPromptMode` | `--system-prompt` / `--append-system-prompt` | `replace` (default) or `append` |
-| `skills` / `skill` | repeated `--skill <resolved path>` | Names resolved from Pi's project, package, settings and user skill locations. Empty list or `inheritSkills: false` = `--no-skills`. An unknown name is an error |
+| `skills` | repeated `--skill <resolved path>` | Names looked up in `.pi/skills`, `.agents/skills`, `~/.pi/agent/skills`, `~/.agents/skills`; anything else (package or settings skills) goes in `skillPath`. Empty list or `inheritSkills: false` = `--no-skills`. An unknown name is an error |
 | `skillPath` | repeated `--skill <path>` | Relative to the agent file's directory; absolute paths as is |
 | `extensions` | `--no-extensions` + repeated `--extension` | Empty list = only `--no-extensions`. Relative paths resolve against the agent file; `builtin:` `npm:` `git:` `http(s):` `file:` and absolute paths pass through |
 | `subagentOnlyExtensions` | joins the `--extension` allowlist | Same rules as `extensions` |
@@ -57,11 +57,13 @@ stays the same in follow-ups.
 Keep the body to reusable role rules. Put the concrete task, paths and one-off context in
 the task.
 
-## 4. Choosing tools and thinking
+## 4. Choosing model, tools and thinking
 
-- Read-only research or review: `tools: read, grep, find, ls`, optionally
-  `excludeTools: write, edit`.
-- Code changes: omit `tools` (Pi's default set) or list them.
+- `model`: pin the model the role should run on, e.g. a cheaper one for lookups;
+  `pi --list-models SEARCH` lists the ids. Omit it for Pi's default.
+- Read-only research or review: `tools: read, grep, find, ls`. `bash` can write files
+  too; leave it out when the agent must stay read-only.
+- Code changes: omit `tools` (Pi's default set, MCP included) or list them.
 - Text only: empty `tools:` (= `--no-tools`).
 - `thinking`: `low` for lookups, `medium` for review and planning, `high` for hard reasoning.
 
@@ -70,11 +72,15 @@ the task.
 ```bash
 pier agents validate /tmp/sql-reviewer.md
 pier run --agent-file /tmp/sql-reviewer.md "sample" --dry-run
-pier agents new sql-reviewer --file /tmp/sql-reviewer.md          # <cwd>/.pier/agents/
-pier agents new sql-reviewer --file /tmp/sql-reviewer.md --user   # $PIER_HOME/agents/ (default ~/.pier/agents/)
 ```
 
-- An existing file needs `--force`.
+Save the file as `<cwd>/.pier/agents/<name>.md` (project) or
+`$PIER_HOME/agents/<name>.md` (user, default `~/.pier/agents/`); create the
+directory if needed (files directly in it; subdirectories are not scanned). The
+frontmatter `name` (or the file name) is the lookup key; on
+the same name the project file wins over the user file, which wins over the bundled
+examples.
+
 - `validate` checks the name, body, `thinking`, `systemPromptMode` (`replace` or `append`),
   the `inheritProjectContext` / `inheritSkills` booleans, and tool names; it warns about
   fields with no effect (including `defaultProvider` without a `model`).

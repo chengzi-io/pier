@@ -17,7 +17,8 @@ credentials, so no model call).
 | `--no-extensions` | Empty `extensions: []`, or allowlist prelude when extensions are listed |
 | `--no-context-files` | `inheritProjectContext: false` (`inheritGlobalContext` ignored) |
 | `--print` | Always. Pi exits non-zero when the final reply has stopReason `error`, `aborted` or `length`; `--mode json` exits 0 then (docs/cli-integration.md). stdout is discarded; the reply is read from the session file |
-| `--model` `--provider` `--thinking` `--tools` `--no-tools` `--exclude-tools` `--name` | Frontmatter / CLI |
+| `--model` `--provider` `--thinking` `--tools` `--no-tools` `--exclude-tools` `--name` | Frontmatter; `--model` also from `pier run --model` |
+| `--no-mcp` | `tools:` present without an `mcp__` entry (Pi's `--tools` keeps MCP tools otherwise) |
 | `--session-dir` `--session-id` `--session` | New session per run; `send` passes the session file |
 
 ## Out of scope
@@ -37,7 +38,8 @@ pi-subagents docs). Pier does not install or invoke the pi-subagents package.
 
 ## Session files (checked on Pi 1.4.0)
 
-`--session-dir D --session-id ID` writes `D/--<cwd, / -> ->--/<timestamp>_<ID>.jsonl`.
+`--session-dir D --session-id ID` writes `D/<timestamp>_<ID>.jsonl` (flat, observed on
+1.4.0; pier also accepts a `D/--<cwd>--/` subdir).
 Entry types seen: `session` (header with `cwd`), `session_info` (`name`),
 `model_change`, `thinking_level_change`, `message` (roles `user`, `assistant`,
 `toolResult`, ...). System prompt, tools, skills, extensions and context-file
