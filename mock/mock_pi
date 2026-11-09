@@ -4,7 +4,7 @@
 Shaped after real Pi 1.5.0 behaviour that pier depends on:
 - unknown options -> "Error: Unknown option: X", exit 1
 - `--mode json` session event: {"type":"session","version":3,"id","timestamp","cwd"} (no file path)
-- session file <session-dir>/--<cwd with / -> ->--/<ts>_<id>.jsonl holding a session header
+- session file <session-dir>/<ts>_<id>.jsonl (Pi 1.4.0 with --session-dir) holding a session header
   and {"type":"message","message":{"role":"user"|"assistant",...}} entries; the user
   message is written before the model "thinks", the assistant reply after
 - `--session REF` that matches nothing -> "No session found matching", exit 1
@@ -130,9 +130,8 @@ def main() -> int:
             if existing:
                 sfile = existing[0]
             else:
-                proj = sdir / ("--" + os.getcwd().strip("/").replace("/", "-") + "--")
-                proj.mkdir(parents=True, exist_ok=True)
-                sfile = proj / f"{time.strftime('%Y-%m-%dT%H-%M-%S')}_{sid}.jsonl"
+                sdir.mkdir(parents=True, exist_ok=True)
+                sfile = sdir / f"{time.strftime('%Y-%m-%dT%H-%M-%S')}_{sid}.jsonl"
                 write_entry(sfile, {"type": "session", "version": 3, "id": sid,
                                     "timestamp": "2026-01-01T00:00:00.000Z", "cwd": os.getcwd()})
         write_entry(sfile, {"type": "message", "message": {

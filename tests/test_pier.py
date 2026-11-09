@@ -6,8 +6,6 @@ Pi binary with an empty HOME (no credentials -> no model call).
 """
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
 import os
 import shlex
@@ -25,14 +23,11 @@ ROOT = Path(__file__).resolve().parent.parent
 PIER = ROOT / "scripts" / "pier"
 MOCK = ROOT / "mock" / "mock_pi"
 
-
-def load_mod():
-    loader = importlib.machinery.SourceFileLoader("pier_mod", str(PIER))
-    spec = importlib.util.spec_from_loader("pier_mod", loader)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["pier_mod"] = mod
-    loader.exec_module(mod)
-    return mod
+sys.path.insert(0, str(ROOT / "scripts"))
+import pier_agents  # noqa: E402
+import pi_runtime  # noqa: E402
+import pi_state  # noqa: E402
+import toon  # noqa: E402
 
 
 class Base(unittest.TestCase):
@@ -48,7 +43,7 @@ class Base(unittest.TestCase):
             "PI_BIN": str(MOCK), "HOME": str(self.home), "MOCK_PI_RECORD": str(self.rec),
             "MOCK_PI_RECORD_DIR": str(self.rec_dir),
         }
-        for k in ("PIER_HOME", "PIER_AGENT_DIRS", "MOCK_PI_FAIL", "MOCK_PI_FAIL_ON",
+        for k in ("PIER_HOME", "MOCK_PI_FAIL", "MOCK_PI_FAIL_ON",
                   "MOCK_PI_SLEEP", "MOCK_PI_SLEEP_ON", "MOCK_PI_REPLY"):
             self.env[k] = ""
 
@@ -137,30 +132,27 @@ def flag(argv, name):
 
 class FrontmatterTests(unittest.TestCase):
     def setUp(self):
-        self.mod = load_mod()
+        pass
 
     def test_simple(self):
-        fm, body = self.mod.parse_frontmatter("---\nname: explorer\ntools: read, grep\n---\n\nHello body\n")
+        fm, body = pier_agents.parse_frontmatter("---\nname: explorer\ntools: read, grep\n---\n\nHello body\n")
         self.assertEqual(fm, {"name": "explorer", "tools": "read, grep"})
         self.assertEqual(body, "Hello body")
 
     def test_blocks_and_lists(self):
-        fm, _ = self.mod.parse_frontmatter("---\nname: x\ndescription: |\n  one\n  two\ntools:\n  - read\n  - grep\n---\nB\n")
+        fm, _ = pier_agents.parse_frontmatter("---\nname: x\ndescription: |\n  one\n  two\ntools:\n  - read\n  - grep\n---\nB\n")
         self.assertEqual(fm["description"], "one\ntwo")
-        self.assertEqual(self.mod.parse_list(fm["tools"]), ["read", "grep"])
-        self.assertEqual(self.mod.parse_list("- read  # c\n- 'grep'"), ["read", "grep"])
+        self.assertEqual(pier_agents.parse_list(fm["tools"]), ["read", "grep"])
+        self.assertEqual(pier_agents.parse_list("- read  # c\n- 'grep'"), ["read", "grep"])
 
-    def test_classify(self):
-        c = self.mod.classify_fields({"name": "a", "model": "m", "description": "d", "async": "true",
-                                      "systemPromptMode": "replace", "launcher": "x", "weird": "1"})
-        self.assertEqual(c["mapped"], ["name", "model", "systemPromptMode"])
-        self.assertEqual(c["meta"], ["description"])
-        self.assertEqual(c["ignored"], ["async", "launcher", "weird"])
+    def test_ignored_fields(self):
+        ignored = pier_agents.ignored_fields({"name": "a", "model": "m", "description": "d", "async": "true",
+                                              "systemPromptMode": "replace", "launcher": "x", "weird": "1"})
+        self.assertEqual(ignored, ["async", "launcher", "weird"])
 
 
 class LastTurnTests(unittest.TestCase):
     def setUp(self):
-        self.mod = load_mod()
         self.tmp = Path(tempfile.mkdtemp(prefix="pier-reply-"))
 
     def tearDown(self):
@@ -184,13 +176,13 @@ class LastTurnTests(unittest.TestCase):
             text("assistant", "a2 final"),
             trailer='{"type":"message","mess',  # line cut short by a killed Pi
         )
-        t = self.mod.last_turn(p)
+        t = pi_state.last_turn(p)
         self.assertEqual((t.reply, t.stop), ("a2 final", None))
 
     def test_unanswered_turn_has_no_reply(self):
         p = self.session({"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"},
                          {"role": "user", "content": "q2"})
-        self.assertEqual(self.mod.last_turn(p).reply, "")
+        self.assertEqual(pi_state.last_turn(p).reply, "")
 
     def test_usage_is_summed_over_the_turn(self):
         # Pi writes one per-call usage block per assistant message; a turn with
@@ -206,7 +198,7 @@ class LastTurnTests(unittest.TestCase):
              "totalTokens": 334, "cost": {"input": 0.6, "output": 0.7, "total": 1.3}},
         ]
         p = self.session({"role": "user", "content": "q"}, *[am(u) for u in blocks])
-        usage = self.mod.last_turn(p).usage
+        usage = pi_state.last_turn(p).usage
         self.assertEqual(usage["input"], 60)
         self.assertEqual(usage["output"], 9)
         self.assertEqual(usage["cacheRead"], 600)
@@ -215,8 +207,8 @@ class LastTurnTests(unittest.TestCase):
 
     def test_failed_stop_reason_beats_exit_zero_and_earlier_text(self):
         # JSON-mode Pi exits 0 on provider errors; the session entry is authoritative.
-        t = self.mod.Turn("let me look", "error", "529 overloaded")
-        out = self.mod.turn_outcome(t, 0, "")
+        t = pi_state.Turn("let me look", "error", "529 overloaded")
+        out = pi_runtime.turn_outcome(t, 0, "")
         self.assertEqual(out.reply, "")
         self.assertIn("529 overloaded", out.error)
         self.assertEqual(out.code, 1)
@@ -245,17 +237,21 @@ class DiscoveryTests(Base):
             self.assertIn(n, r.stderr)
         self.assertEqual(self.calls(), [])
 
-    def test_paths_command(self):
-        out = self.pier("agents", "paths").stdout
-        rows = [l.split(",")[0].strip() for l in out.splitlines() if l.startswith("  ")]
-        self.assertEqual(rows, ["skill", "user", "project"])
-        self.assertIn(str((self.state() / "agents").resolve()), out)
-
     def test_list_is_toon_table(self):
         r = self.pier("agents", "list")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue(r.stdout.startswith("[4]{name,description}:"), r.stdout)
-        self.assertIn("\n  reviewer,", r.stdout)
+        self.assertTrue(r.stdout.startswith("[4]{name,model,description}:"), r.stdout)
+        self.assertIn('\n  reviewer,"",', r.stdout)  # no model: Pi's default
+        self.write_agent(".pier/agents/m.md", "---\nname: m\nmodel: zai/glm:low\n---\nB\n")
+        self.assertIn('\n  m,"zai/glm:low",', self.pier("agents", "list").stdout)
+
+    def test_unreadable_agent_is_skipped_with_a_note(self):
+        self.write_agent(".pier/agents/ok.md", "---\nname: ok\n---\nB\n")
+        (self.proj / ".pier" / "agents" / "bad.md").write_bytes(b"\xff\xfe bad")
+        r = self.pier("agents", "list")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("skipping agent", r.stderr)
+        self.assertIn("\n  ok,", r.stdout)
 
     def test_show_prints_path_and_file(self):
         r = self.pier("agents", "show", "reviewer")
@@ -276,6 +272,7 @@ class MappingTests(Base):
         self.assertEqual(flag(a, "--thinking"), "high")
         self.assertEqual(flag(a, "--tools"), "read,bash")
         self.assertEqual(flag(a, "--exclude-tools"), "write")
+        self.assertIn("--no-mcp", a)
         self.assertEqual(flag(a, "--name"), "m")
         self.assertEqual(Path(flag(a, "--session-dir")).resolve(), (self.state() / "sessions").resolve())
         self.assertIn("--session-id", a)
@@ -289,15 +286,24 @@ class MappingTests(Base):
         self.assertEqual(flag(a, "--provider"), "openai")
         self.assertEqual(flag(a, "--model"), "gpt-x:low")
         self.assertNotIn("--thinking", a)  # suffix wins over frontmatter thinking
-        self.assertEqual(flag(self.dry("run", "p", "go", "--thinking", "max"), "--thinking"), "max")
+        a = self.dry("run", "p", "go", "--model", "zai/glm:max")  # --model wins, suffix included
+        self.assertEqual(flag(a, "--model"), "zai/glm:max")
+        self.assertNotIn("--provider", a)
+        self.assertNotIn("--thinking", a)
 
-    def test_cli_overrides(self):
-        a = self.dry("run", "reviewer", "x", "--model", "zai/glm", "--tools", "read")
-        self.assertEqual(flag(a, "--tools"), "read")
+    def test_model_is_the_only_override(self):
+        a = self.dry("run", "reviewer", "x", "--model", "zai/glm")
         self.assertEqual(flag(a, "--model"), "zai/glm")
-        self.assertIn("--no-tools", self.dry("run", "reviewer", "x", "--no-tools"))
-        r = self.pier("run", "reviewer", "x", "--no-tools", "--tools", "read")
-        self.assertEqual(r.returncode, 2)
+        self.assertEqual(flag(a, "--tools"), "read,grep,find,ls,bash")  # frontmatter kept
+        for removed in (["--tools", "read"], ["--no-tools"], ["--exclude-tools", "bash"],
+                        ["--provider", "p"], ["--thinking", "high"], ["--name", "n"],
+                        ["--max-chars", "1"], ["--cwd", "."]):
+            r = self.pier("run", "reviewer", "x", *removed)
+            self.assertEqual(r.returncode, 2, removed)
+            self.assertIn("unrecognized arguments", r.stderr)
+        r = self.pier("send", "deadbeef", "x", "--dry-run")
+        self.assertIn("unrecognized arguments", r.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_non_native_tools_dropped_with_note(self):
         self.write_agent(".pier/agents/e.md", "---\nname: e\ntools: contact_supervisor, mcp:x/y\nlauncher: tmux\n---\nB\n")
@@ -315,8 +321,17 @@ class MappingTests(Base):
                          "---\nname: m\ntools: read, mcp__radius__search, mcp__radius__*\n---\nB\n")
         a = self.dry("run", "m", "go")
         self.assertEqual(flag(a, "--tools"), "read,mcp__radius__search,mcp__radius__*")
-        a = self.dry("run", "m", "go", "--exclude-tools", "mcp__*")
-        self.assertEqual(flag(a, "--exclude-tools"), "mcp__*")
+        self.assertNotIn("--no-mcp", a)  # named MCP tools keep MCP on
+
+    def test_tools_allowlist_without_mcp_turns_mcp_off(self):
+        # Pi's --tools keeps all MCP tools unless an entry names one.
+        self.assertIn("--no-mcp", self.dry("run", "explorer", "go"))
+        self.write_agent(".pier/agents/t.md", "---\nname: t\ntools:\n---\nB\n")
+        a = self.dry("run", "t", "go")
+        self.assertIn("--no-tools", a)
+        self.assertIn("--no-mcp", a)
+        self.write_agent(".pier/agents/d.md", "---\nname: d\n---\nB\n")  # no tools key: Pi defaults
+        self.assertNotIn("--no-mcp", self.dry("run", "d", "go"))
 
     def test_prompt_is_task_and_body_is_system_prompt(self):
         self.write_agent(".pier/agents/c.md", "---\nname: c\n---\n\nROLE LINE\n\nSecond para.\n\n")
@@ -355,21 +370,6 @@ class InputModesTests(Base):
         r = self.pier("run", "reviewer", "WORDS", input_text="leak")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.argv()[-1], "WORDS")
-
-    def test_task_from_file(self):
-        p = self.tmp / "task.md"
-        p.write_text("from a file\n", encoding="utf-8")
-        r = self.pier("run", "reviewer", "--file", str(p))
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self.argv()[-1], "from a file")
-        r = self.pier("run", "reviewer", "--file", "-", input_text="from stdin\n")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self.argv()[-1], "from stdin")
-
-    def test_task_file_missing_is_an_error(self):
-        r = self.pier("run", "reviewer", "--file", str(self.tmp / "nope.md"))
-        self.assertEqual(r.returncode, 2)
-        self.assertIn("cannot read task file", r.stderr)
 
     def test_dash_task_needs_separator(self):
         r = self.pier("run", "reviewer", "-hello")
@@ -428,37 +428,6 @@ class AgentAuthoringTests(Base):
         self.assertIn("inheritSkills", r.stdout)
         self.assertIn("defaultProvider has no effect without model", r.stdout)
 
-    def test_new_default_project_path(self):
-        p = self.tmp / "def.md"
-        p.write_text(self.GOOD)
-        r = self.pier("agents", "new", "sql-reviewer", "--file", str(p))
-        target = (self.proj / ".pier" / "agents" / "sql-reviewer.md").resolve()
-        self.assertIn(f"written: {target}", r.stdout)
-        self.assertTrue(target.exists())
-        r = self.pier("agents", "new", "sql-reviewer", "--file", str(p))
-        self.assertEqual(r.returncode, 2)  # no silent overwrite
-        self.assertIn("--force", r.stderr)
-        r = self.pier("agents", "new", "sql-reviewer", "--file", "-", "--user", input_text=self.GOOD)
-        self.assertTrue((self.state() / "agents" / "sql-reviewer.md").exists(), r.stderr)
-
-    def test_new_never_touches_pi_or_skill_dirs(self):
-        p = self.tmp / "def.md"
-        p.write_text(self.GOOD)
-        before = sorted(x.name for x in (ROOT / "agents").iterdir())
-        self.pier("agents", "new", "sql-reviewer", "--file", str(p))
-        self.pier("agents", "new", "sql-reviewer", "--file", str(p), "--user")
-        self.assertFalse((self.home / ".pi").exists())
-        self.assertFalse((self.proj / ".pi").exists())
-        self.assertFalse((self.proj / ".agents").exists())
-        self.assertEqual(before, sorted(x.name for x in (ROOT / "agents").iterdir()))
-
-    def test_new_rejects_name_mismatch(self):
-        p = self.tmp / "def.md"
-        p.write_text(self.GOOD)
-        r = self.pier("agents", "new", "other", "--file", str(p))
-        self.assertEqual(r.returncode, 1)
-        self.assertFalse((self.proj / ".pier" / "agents" / "other.md").exists())
-
 
 class SessionTests(Base):
     def test_run_prints_reply_and_session(self):
@@ -484,14 +453,22 @@ class SessionTests(Base):
             self.assertEqual(r.returncode, 1, stop)
             self.assertEqual(r.stdout, "", stop)  # never the "let me look" text
             self.assertIn(f"model run {stop}: mock {stop}: 529 overloaded", r.stderr)
-            r = self.pier("result", self.sid_of(r))
-            self.assertEqual(r.returncode, 1)
+
+    def test_turn_ending_on_a_tool_call_is_a_failure(self):
+        # seen with real Pi: an extension ends a --print run right after the
+        # model asks for a tool; the preamble text is not the reply
+        r = self.pier("run", "reviewer", "x", env={"MOCK_PI_STOP": "toolUse", "MOCK_PI_REPLY": "I'll look."})
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("turn ended at a tool call", r.stderr)
+        self.assertIn(",failed,", self.pier("ps").stdout)
 
     def test_length_prints_partial_reply_and_fails(self):
         r = self.pier("run", "reviewer", "x", env={"MOCK_PI_STOP": "length", "MOCK_PI_REPLY": "PARTIAL"})
         self.assertEqual(r.returncode, 1)
         self.assertEqual(r.stdout, "PARTIAL\n")
         self.assertIn("output token limit", r.stderr)
+        self.assertIn(",failed,", self.pier("ps").stdout)  # a cut reply is not ok
 
     def test_over_budget_reply_spills_to_file(self):
         reply = "A" * 50_000
@@ -504,16 +481,18 @@ class SessionTests(Base):
         self.assertEqual(lines[0], "A" * 2_000)  # 2k preview
         self.assertRegex(lines[-1], r"\[\.\.\. 48000 more chars; full reply: .+\]$")  # last line = path
         self.assertIn(str(path), lines[-1])
-        r = self.pier("result", sid, "--max-chars", "0")
-        self.assertEqual(r.stdout, f"full reply: {Path(path).resolve()}\n")  # 0 = path only (resolve: /var symlink)
-        r = self.pier("result", sid, "--max-chars", "100000")
+        r = self.pier("run", "reviewer", "x", env={"MOCK_PI_REPLY": reply, "PIER_MAX_CHARS": "0"})
+        zero_sid = self.sid_of(r)
+        zero_path = self.state() / "out" / f"{zero_sid}.md"
+        self.assertEqual(r.stdout, f"full reply: {Path(zero_path).resolve()}\n")  # 0 = path only
+        r = self.pier("run", "reviewer", "x", env={"MOCK_PI_REPLY": reply, "PIER_MAX_CHARS": "100000"})
         self.assertEqual(r.stdout, reply + "\n")  # a large budget inlines it all
 
     def test_small_budget_caps_the_preview(self):
         # budget < reply < PREVIEW_CHARS used to print the whole reply and a
         # negative "more chars" count.
         reply = "C" * 1_500
-        r = self.pier("run", "reviewer", "x", "--max-chars", "1000", env={"MOCK_PI_REPLY": reply})
+        r = self.pier("run", "reviewer", "x", env={"MOCK_PI_REPLY": reply, "PIER_MAX_CHARS": "1000"})
         self.assertEqual(r.returncode, 0, r.stderr)
         lines = r.stdout.splitlines()
         self.assertEqual(lines[0], "C" * 1_000)
@@ -529,8 +508,8 @@ class SessionTests(Base):
         self.assertEqual(lines[0], "B" * 2_000)
         self.assertIn(str(Path(self.state() / "out" / f"{sid}.md").resolve()), lines[-1])
         # a nonzero exit keeps the path as stdout's last line
-        r = self.pier("send", sid, "again", "--max-chars", "10",
-                      env={"MOCK_PI_REPLY": reply, "MOCK_PI_STOP": "length"})
+        r = self.pier("send", sid, "again",
+                      env={"MOCK_PI_REPLY": reply, "MOCK_PI_STOP": "length", "PIER_MAX_CHARS": "10"})
         self.assertEqual(r.returncode, 1)
         self.assertTrue(r.stdout.splitlines()[-1].startswith("[... "), r.stdout)
 
@@ -582,22 +561,17 @@ class SessionTests(Base):
         self.assertNotIn(" — ", line)  # the reason is reported once, below
         self.assertEqual(r.stderr.count("pier: error:"), 1, r.stderr)
 
-    def test_send_resolves_prefix_name_and_errors_on_ambiguity(self):
+    def test_send_resolves_prefix_and_errors_on_ambiguity(self):
         sid = self.sid_of(self.pier("run", "reviewer", "first"))
         r = self.pier("send", sid[:12], "via prefix", cwd=self.tmp)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("[resumed", r.stdout)
-        r = self.pier("send", "reviewer", "via name", cwd=self.tmp)  # --name handle
-        self.assertEqual(r.returncode, 0, r.stderr)
-        # same --name twice: newest wins (the later run's session)
-        self.pier("run", "reviewer", "second", "--name", "dup")
-        newest = self.sid_of(self.pier("run", "reviewer", "third", "--name", "dup"))
-        r = self.pier("send", "dup", "newest", cwd=self.tmp)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn(f"[resumed {newest}", r.stdout)
+        r = self.pier("send", "reviewer", "x")  # an agent name is not a session handle
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unknown session", r.stderr)
         # an ambiguous prefix names its alternatives
         other = self.state() / "sessions" / f"{sid[:6]}aa{sid[6:].replace('-', '')}.pier.json"
-        other.write_text(json.dumps({"cwd": str(self.tmp), "flags": [], "name": "other"}), encoding="utf-8")
+        other.write_text(json.dumps({"cwd": str(self.tmp), "flags": [], "agent": "other"}), encoding="utf-8")
         try:
             r = self.pier("send", sid[:6], "x")
             self.assertEqual(r.returncode, 2)
@@ -606,26 +580,16 @@ class SessionTests(Base):
         finally:
             other.unlink()
 
-    def test_result_reads_last_turn_only(self):
-        sid = self.sid_of(self.pier("run", "reviewer", "first"))
-        self.assertEqual(self.pier("result", sid).stdout, "mock-ok: first\n")
-        r = self.pier("send", sid, "second", env={"MOCK_PI_FAIL": "1"})
-        self.assertEqual(r.returncode, 3)
-        r = self.pier("result", sid)
-        self.assertEqual(r.returncode, 1)  # never hands back the stale first reply
-        self.assertIn("no reply after the last prompt", r.stderr)
-
-    def test_send_and_result_refuse_a_running_session(self):
+    def test_send_refuses_a_running_session(self):
         slow = subprocess.Popen([sys.executable, str(PIER), "run", "reviewer", "slow"],
                                 cwd=str(self.proj), env=self.full_env({"MOCK_PI_SLEEP": "30"}),
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
         try:
             sid = self.wait_for_running_pid()
-            for cmd in ("send", "result"):
-                r = self.pier(cmd, sid, *(["x"] if cmd == "send" else []))
-                self.assertEqual(r.returncode, 2, f"{cmd}: {r.stderr}")
-                self.assertIn("is running", r.stderr, cmd)
+            r = self.pier("send", sid, "x")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("is running", r.stderr)
         finally:
             slow.send_signal(signal.SIGTERM)
             self.assertEqual(slow.wait(timeout=10), 128 + signal.SIGTERM)
@@ -689,28 +653,6 @@ class SessionTests(Base):
             decoy.terminate()
             decoy.wait(timeout=10)
 
-    def test_ref_prefers_an_exact_name_over_a_uuid_prefix(self):
-        self.sidecar_dir().mkdir(parents=True, exist_ok=True)
-        for sid, name in [("aaaa1111-1111-1111-1111-111111111111", "other"),
-                          ("aaaa2222-2222-2222-2222-222222222222", "aaaa")]:
-            (self.sidecar_dir() / f"{sid}.pier.json").write_text(
-                json.dumps({"cwd": str(self.proj.resolve()), "flags": [], "name": name}),
-                encoding="utf-8")
-        r = self.pier("ps", "aaaa")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("aaaa2222", r.stdout)  # the --name handle wins
-        self.assertNotIn("aaaa1111", r.stdout)
-
-    def test_cli_thinking_and_name_are_validated(self):
-        r = self.pier("run", "reviewer", "x", "--thinking", "ultra")
-        self.assertEqual(r.returncode, 2)
-        self.assertIn("off|minimal|low|medium|high|xhigh|max", r.stderr)
-        r = self.pier("run", "reviewer", "x", "--name", "bad name")
-        self.assertEqual(r.returncode, 2)
-        self.assertIn("letters, digits", r.stderr)
-        a = self.dry("run", "reviewer", "x", "--thinking", "HIGH")
-        self.assertEqual(flag(a, "--thinking"), "high")
-
     def test_corrupt_sidecar_is_skipped_not_fatal(self):
         sid = self.sid_of(self.pier("run", "reviewer", "hello"))
         bad = self.sidecar_dir() / "0badc0de-0000-0000-0000-000000000000.pier.json"
@@ -733,14 +675,13 @@ class SessionTests(Base):
                   self.state() / "out" / f"{sid}.md"):
             self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600, f)
 
-    def test_negative_max_chars_is_rejected(self):
-        r = self.pier("run", "reviewer", "x", "--max-chars", "-1")
-        self.assertEqual(r.returncode, 2)
-        self.assertIn("must be >= 0", r.stderr)
+    def test_bad_max_chars_env_is_rejected_before_pi_runs(self):
+        for raw in ("-1", "lots"):
+            r = self.pier("run", "reviewer", "x", env={"PIER_MAX_CHARS": raw})
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("PIER_MAX_CHARS", r.stderr)
         self.assertEqual(self.calls(), [])
-        r = self.pier("run", "reviewer", "x", env={"PIER_MAX_CHARS": "-1"})
-        self.assertEqual(r.returncode, 2)
-        self.assertIn("PIER_MAX_CHARS", r.stderr)
+        self.assertFalse(self.sidecar_dir().exists())
 
     def test_dry_run_clips_long_task(self):
         r = self.pier("run", "reviewer", "word " * 4000, "--dry-run")
@@ -748,16 +689,11 @@ class SessionTests(Base):
         self.assertLess(len(r.stdout), 2000)
         self.assertRegex(r.stdout, r"…<\d+ chars>")
 
-    def test_ps_rejects_missing_cwd(self):
-        r = self.pier("ps", "--cwd", str(self.tmp / "nope"))
-        self.assertEqual(r.returncode, 2)
-        self.assertIn("--cwd does not exist", r.stderr)
-
     def test_ps_notes_the_limit(self):
         for i in range(12):
             self.sidecar_dir().mkdir(parents=True, exist_ok=True)
             (self.sidecar_dir() / f"00000000-0000-0000-0000-{i:012d}.pier.json").write_text(
-                json.dumps({"cwd": str(self.proj.resolve()), "flags": [], "name": "a"}),
+                json.dumps({"cwd": str(self.proj.resolve()), "flags": [], "agent": "a"}),
                 encoding="utf-8")
         r = self.pier("ps")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -828,6 +764,25 @@ class SessionTests(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         rows = [l for l in r.stdout.splitlines() if "," in l and not l.startswith("sessions")]
         self.assertEqual(len(rows), 1)
+
+    def test_ps_shows_the_first_reply_line(self):
+        # the report contract puts the result first
+        self.pier("run", "reviewer", "x", env={"MOCK_PI_REPLY": "RESULT LINE\ndetail\nsign-off"})
+        r = self.pier("ps")
+        self.assertTrue(r.stdout.startswith("sessions[1]{ref,agent,state,age,tok,reply}:"), r.stdout)
+        self.assertIn(",RESULT LINE", r.stdout)
+        self.assertNotIn("sign-off", r.stdout)
+
+    def test_ps_marks_a_run_pi_never_recorded_as_failed(self):
+        # e.g. an unknown model: Pi exits before writing the session file
+        self.pier("run", "reviewer", "x", env={"MOCK_PI_FAIL": "1"})
+        self.assertIn(",failed,", self.pier("ps").stdout)
+
+    def test_ps_lists_only_this_directory(self):
+        self.pier("run", "reviewer", "here")
+        other = self.tmp / "other"
+        other.mkdir()
+        self.assertIn("no sessions", self.pier("ps", cwd=other).stderr)
 
 
 class WorktreeTests(Base):
@@ -925,6 +880,15 @@ class WorktreeTests(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(Path(cwd_rec.read_text(encoding="utf-8")).resolve(), self.proj.resolve())
 
+    def test_send_after_a_kept_worktree_is_deleted_runs_in_the_project(self):
+        wt, stderr = self.run_with_worktree_mutation(
+            lambda w: (w / "f.txt").write_text("edited\n", encoding="utf-8"))
+        self.git("worktree", "remove", "--force", str(wt))
+        cwd_rec = self.tmp / "pi-cwd"
+        r = self.pier("send", stderr.split()[1], "continue", env={"MOCK_PI_RECORD_CWD": str(cwd_rec)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(Path(cwd_rec.read_text(encoding="utf-8")).resolve(), self.proj.resolve())
+
     def test_sigterm_removes_a_clean_worktree(self):
         slow = subprocess.Popen([sys.executable, str(PIER), "run", "reviewer", "x", "--worktree"],
                                 cwd=str(self.proj), env=self.full_env({"MOCK_PI_SLEEP": "30"}),
@@ -986,14 +950,14 @@ class StorageTests(Base):
     def test_state_only_under_pier_home(self):
         other = self.tmp / "other"
         other.mkdir()
-        sid = self.sid_of(self.pier("run", "reviewer", "hello", "--cwd", str(self.proj), cwd=other))
+        sid = self.sid_of(self.pier("run", "reviewer", "hello", cwd=other))
         self.assertFalse((self.proj / ".pier").exists())
         self.assertFalse((other / ".pier").exists())
         files = sorted(str(p.relative_to(self.state())) for p in self.state().rglob("*") if p.is_file())
         self.assertEqual(len(files), 2, files)
         self.assertIn(f"sessions/{sid}.pier.json", files)
         pi_file = [f for f in files if f.endswith(".jsonl")][0]
-        self.assertTrue(pi_file.startswith("sessions/--") and pi_file.endswith(f"_{sid}.jsonl"))
+        self.assertTrue(pi_file.startswith("sessions/") and pi_file.endswith(f"_{sid}.jsonl"))
 
     def test_pier_home_override(self):
         alt = self.tmp / "alt"
@@ -1004,11 +968,10 @@ class StorageTests(Base):
 
 class FormatTests(unittest.TestCase):
     def test_fmt_tokens_rounds(self):
-        m = load_mod()
-        self.assertEqual(m._fmt_tokens(999), "999")
-        self.assertEqual(m._fmt_tokens(1_801), "1.8k")
-        self.assertEqual(m._fmt_tokens(12_345), "12k")
-        self.assertEqual(m._fmt_tokens(1_234_567), "1.2M")
+        self.assertEqual(pi_state.fmt_tokens(999), "999")
+        self.assertEqual(pi_state.fmt_tokens(1_801), "1.8k")
+        self.assertEqual(pi_state.fmt_tokens(12_345), "12k")
+        self.assertEqual(pi_state.fmt_tokens(1_234_567), "1.2M")
 
 
 class ToonEncodeTests(unittest.TestCase):
@@ -1017,8 +980,7 @@ class ToonEncodeTests(unittest.TestCase):
     OFFICIAL_CLI = Path("/workspace/toon-validator/node_modules/@toon-format/cli/bin/toon.mjs")
 
     def setUp(self):
-        self.mod = load_mod()
-        self.enc = self.mod.encode_toon
+        self.enc = toon.encode_toon
 
     def _official_available(self) -> bool:
         return self.OFFICIAL_CLI.is_file()
@@ -1164,14 +1126,14 @@ class SystemPromptAndResourcesTests(Base):
         # every run carries the ~60-token report contract, after the agent's own prompt
         a = self.dry("run", "reviewer", "t")
         appends = [v for f, v in zip(a, a[1:]) if f == "--append-system-prompt"]
-        self.assertEqual(appends, [load_mod().REPORT_CONTRACT])
+        self.assertEqual(appends, [pi_runtime.REPORT_CONTRACT])
         self.assertLess(a.index("--system-prompt"), a.index("--append-system-prompt"))
         self.write_agent(".pier/agents/a.md",
                          "---\nname: a\nsystemPromptMode: append\n---\nAPPEND ME\n")
         a = self.dry("run", "a", "t")
         self.assertEqual(a.count("--append-system-prompt"), 2)  # role append first, contract after
         self.assertEqual(a[a.index("--append-system-prompt", a.index("--append-system-prompt") + 1) + 1],
-                         load_mod().REPORT_CONTRACT)
+                         pi_runtime.REPORT_CONTRACT)
 
     def test_empty_skills_and_inherit_false(self):
         self.write_agent(".pier/agents/s.md", "---\nname: s\nskills:\n---\nB\n")
@@ -1193,12 +1155,32 @@ class SystemPromptAndResourcesTests(Base):
         self.assertEqual(len(skills), 2)
         self.assertTrue(any(s.endswith("demo-skill/SKILL.md") for s in skills))
         self.assertTrue(any(s.endswith("priv/local-skill.md") for s in skills))
+        # files in subdirs of an agents dir are not agents
+        self.assertNotIn("local", self.pier("agents", "list").stdout)
+
+    def test_package_declared_skills_are_not_searched(self):
+        # only Pi's standard skill dirs; package/settings skills go through skillPath
+        pkg = self.proj / "node_modules" / "p" / "skills" / "pkg-skill"
+        pkg.mkdir(parents=True)
+        (pkg / "SKILL.md").write_text("---\nname: pkg-skill\n---\nX\n")
+        (self.proj / "node_modules" / "p" / "package.json").write_text('{"pi": {"skills": "skills"}}')
+        self.write_agent(".pier/agents/s.md", "---\nname: s\nskills: pkg-skill\n---\nB\n")
+        r = self.pier("run", "s", "t", "--dry-run")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("use skillPath", r.stderr)
 
     def test_unresolved_skill_errors(self):
         self.write_agent(".pier/agents/s.md", "---\nname: s\nskills: missing-skill\n---\nB\n")
         r = self.pier("run", "s", "t", "--dry-run")
         self.assertEqual(r.returncode, 2)
         self.assertIn("missing-skill", r.stderr)
+
+    def test_skill_singular_is_ignored(self):
+        self.write_agent(".pier/agents/s.md", "---\nname: s\nskill: demo-skill\n---\nB\n")
+        r = self.pier("run", "s", "t", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ignored frontmatter", r.stderr)
+        self.assertNotIn("--skill", shlex.split(r.stdout))
 
     def test_extensions_allowlist_and_empty(self):
         ext = self.proj / ".pier" / "agents" / "my-ext.ts"
