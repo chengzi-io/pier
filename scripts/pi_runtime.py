@@ -15,7 +15,7 @@ from typing import Any, List, Optional, Tuple
 
 from pier_agents import AgentDef, THINKING_SUFFIX_RE, filter_tool_list
 from pi_state import (FAILED_STOPS, PierError, Turn, ensure_dir,
-                      find_session_file, fmt_tokens, last_turn, patch_sidecar,
+                      find_session_file, last_turn, patch_sidecar,
                       process_start, sessions_dir, tail_text, write_private)
 
 DEFAULT_MAX_CHARS = 24_000
@@ -331,20 +331,13 @@ def run_turn(home: Path, binary: str, sid: str, cwd: Path, flags: List[str],
     return turn_outcome(turn, code, err), turn
 
 
-def summary_line(ref: str, out: Outcome, turn: Optional[Turn], name: Optional[str]) -> str:
-    """End-of-run stderr line: `pier: <ref> ok · N tok · $X` (or failed/...)."""
+def summary_line(ref: str, out: Outcome, name: Optional[str]) -> str:
+    """End-of-run stderr line: `pier: <ref> ok (<agent>)` (or failed)."""
     state = "ok" if out.error is None else "failed"
-    bits = [f"pier: {ref} {state}"]
+    line = f"pier: {ref} {state}"
     if name:
-        bits[0] += f" ({name})"
-    if turn and turn.usage:
-        total = turn.usage.get("totalTokens")
-        if isinstance(total, (int, float)):
-            bits.append(f"{fmt_tokens(int(total))} tok")
-        cost = (turn.usage.get("cost") or {}).get("total")
-        if isinstance(cost, (int, float)):
-            bits.append(f"${cost:.2f}")
-    return " · ".join(bits)
+        line += f" ({name})"
+    return line
 
 
 def spill_path(home: Path, sid: str) -> Path:

@@ -101,13 +101,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             spec.cwd = Path(wt["worktree"])
         start_session(home, sid, spec.cwd, flags, spec.agent.name, wt)
         print(f"pier: {ref} started ({spec.agent.name})", file=sys.stderr, flush=True)
-        out, turn = run_turn(home, binary, sid, spec.cwd, flags, ["--session-id", sid], spec.task)
+        out, _ = run_turn(home, binary, sid, spec.cwd, flags, ["--session-id", sid], spec.task)
     finally:
         # Before the summary: cleanup can print, and the last stderr line stays
-        # the summary with tokens and cost.
+        # the summary.
         if wt:
             cleanup_worktree(home, sid, ref, wt)
-    print(summary_line(ref, out, turn, spec.agent.name), file=sys.stderr)
+    print(summary_line(ref, out, spec.agent.name), file=sys.stderr)
     return report(out, home, sid, budget)
 
 
@@ -149,8 +149,8 @@ def cmd_send(args: argparse.Namespace) -> int:
     binary = resolve_pi_binary()
     with session_lock(home, sid):
         ensure_not_running(ref, load_sidecar(home, sid))  # a run may have started since
-        out, turn = run_turn(home, binary, sid, cwd, side["flags"], ["--session", str(sfile)], task)
-    print(summary_line(ref, out, turn, side.get("agent")), file=sys.stderr)
+        out, _ = run_turn(home, binary, sid, cwd, side["flags"], ["--session", str(sfile)], task)
+    print(summary_line(ref, out, side.get("agent")), file=sys.stderr)
     return report(out, home, sid, budget)
 
 
@@ -244,7 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("run", help="start a new Pi session and print its reply",
                         description="Start a new Pi session in the current directory, wait for "
                         "it, print the reply. stderr: 'pier: <ref> started (<agent>)' first, "
-                        "'pier: <ref> ok (<agent>) · tokens · cost' last.")
+                        "'pier: <ref> ok (<agent>)' last.")
     sp.add_argument("words", nargs="*", metavar="AGENT TASK",
                     help="agent name, then the task as words (none = stdin); "
                          "with --agent-file every word is task")

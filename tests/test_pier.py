@@ -553,7 +553,7 @@ class SessionTests(Base):
         ref = self.ref_of(r)
         self.assertEqual(r.stderr.splitlines(),
                          [f"pier: {ref} started (reviewer)",
-                          f"pier: {ref} ok (reviewer) · 1.8k tok · $0.01"])
+                          f"pier: {ref} ok (reviewer)"])
         r = self.pier("run", "reviewer", "x", env={"MOCK_PI_FAIL": "1"})
         ref = self.ref_of(r)
         line = r.stderr.splitlines()[1]
@@ -853,8 +853,8 @@ class WorktreeTests(Base):
         self.assertIn("kept worktree", stderr)
         self.assertIn(str(wt), stderr)
         self.assertTrue(wt.is_dir())
-        # cleanup runs before the summary, so the last stderr line keeps tokens + cost
-        self.assertRegex(stderr.splitlines()[-1], r"^pier: \w+ ok \(reviewer\) · ")
+        # cleanup runs before the summary, so the last stderr line is the summary
+        self.assertRegex(stderr.splitlines()[-1], r"^pier: \w+ ok \(reviewer\)$")
         # a worktree session still belongs to this project in `ps`
         self.assertIn(stderr.split()[1], self.pier("ps").stdout)
         # pier does not touch the caller's checkout

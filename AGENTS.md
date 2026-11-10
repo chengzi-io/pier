@@ -15,8 +15,9 @@ byte pier prints costs its tokens.
 
 ## Invariants
 
-- stdout = the reply only. stderr: `pier: <ref> started (<agent>)` first, then the
-  summary with tokens and cost; on failure a final `pier: error: …` and non-zero exit.
+- stdout = the reply only. stderr: `pier: <ref> started (<agent>)` first, then
+  `pier: <ref> ok|failed (<agent>)`; a failure adds a final `pier: error: …` and a
+  non-zero exit.
 - Behaviour lives in the agent file; the CLI adds only `--agent-file`, `--model`,
   `--worktree`, `--dry-run`. Sessions are addressed by ref only. Keep it that way:
   a new flag needs a reason the agent file cannot cover.

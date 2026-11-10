@@ -73,7 +73,7 @@ Use it (your agent does the same):
 ./scripts/pier run scout "where is the session lock taken and released?"
 # stderr: pier: f3b2a1c0 started (scout)
 # stdout: the answer
-# stderr: pier: f3b2a1c0 ok (scout) · 12k tok · $0.004
+# stderr: pier: f3b2a1c0 ok (scout)
 
 ./scripts/pier send f3b2a1c0 "and who reclaims a stale one?"
 ./scripts/pier run scout "same question" --model anthropic/claude-sonnet-4-5:high
@@ -181,7 +181,7 @@ file passed as `@path`.
 
 | Situation | stdout | stderr | Exit |
 |---|---|---|---|
-| Success | reply | `pier: <ref> started (agent)` … `pier: <ref> ok (agent) · Nk tok · $X` | 0 |
+| Success | reply | `pier: <ref> started (agent)` … `pier: <ref> ok (agent)` | 0 |
 | Model error or abort | — | `pier: error: model run error: …` | Pi's code, else 1 |
 | Reply cut off at the token limit | partial reply | `pier: error: … (continue it: pier send <ref> "continue")` | Pi's code, else 1 |
 | Turn ended on a tool call with no answer (Pi exited mid-turn) | — | `pier: error: turn ended at a tool call …` | Pi's code, else 1 |
