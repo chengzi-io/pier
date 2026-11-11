@@ -17,12 +17,15 @@ byte pier prints costs its tokens.
 
 - stdout = the reply only. stderr: `pier: <ref> started (<agent>)` first, then
   `pier: <ref> ok|failed (<agent>)`; a failure adds a final `pier: error: …` and a
-  non-zero exit.
+  non-zero exit (124 when the run deadline passed).
 - Behaviour lives in the agent file; the CLI adds only `--agent-file`, `--model`,
   `--worktree`, `--dry-run`. Sessions are addressed by ref only. Keep it that way:
   a new flag needs a reason the agent file cannot cover.
-- Pi does not persist system prompt/tools/skills/extensions: the sidecar stores the
-  flags and `send` replays them.
+- Pi does not persist system prompt/tools/skills/extensions (or the run deadline):
+  the sidecar stores the flags and `send` replays them.
+- Pi stays in pier's process group and is killed as a tree, on a deadline and on a
+  signal alike. Every run holds a `$PIER_HOME/locks` flock slot (global + per caller
+  session); a queued run says so once and keeps its deadline.
 - State only under `$PIER_HOME`; never write into the project or Pi's config.
 - Unreleased: change contracts freely, no compat shims.
 

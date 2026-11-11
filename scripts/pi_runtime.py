@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -11,14 +12,17 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from shutil import which
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from pier_agents import AgentDef, THINKING_SUFFIX_RE
-from pi_state import (FAILED_STOPS, PierError, Turn, ensure_dir,
+from pi_state import (FAILED_STOPS, PierError, RunTimedOut, Turn, ensure_dir,
                       find_session_file, last_turn, patch_sidecar,
-                      process_start, sessions_dir, tail_text, write_private)
+                      pid_alive, process_start, run_slots, sessions_dir, tail_text,
+                      write_private)
 
 DEFAULT_MAX_CHARS = 24_000
+DEFAULT_TIMEOUT_MS = 20 * 60 * 1000
+TIMEOUT_EXIT = 124
 PREVIEW_CHARS = 2_000
 INLINE_PROMPT_MAX_BYTES = 100_000
 
@@ -126,6 +130,7 @@ class RunSpec:
     thinking: Optional[str] = None
     tools: Optional[List[str]] = None  # [] -> --no-tools
     exclude_tools: Optional[List[str]] = None
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
     notes: List[str] = field(default_factory=list)  # ignored-field notices etc.
 
 
@@ -135,6 +140,8 @@ def resolve_spec(spec: RunSpec) -> RunSpec:
     if a.ignored:
         spec.notes.append("ignored frontmatter (not mapped, no effect): " + ", ".join(a.ignored))
     spec.model = spec.model or a.model
+    if a.timeout_ms is not None:
+        spec.timeout_ms = a.timeout_ms
     if a.tools is not None:
         spec.tools = a.tools
     if a.exclude_tools:
@@ -233,31 +240,84 @@ _stopping = threading.Event()
 SIGTERM_GRACE_SECONDS = 5
 
 
+def process_tree(root_pid: int) -> List[int]:
+    """`root_pid` and every descendant, from one `ps -A -o pid=,ppid=` snapshot.
+    Pi's tool subprocesses are in this tree: killing only the direct child would
+    leave them running."""
+    try:
+        r = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True,
+                           text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return [root_pid]
+    children: Dict[int, List[int]] = {}
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+    tree: List[int] = []
+    stack = [root_pid]
+    while stack:
+        pid = stack.pop()
+        if pid in tree:
+            continue
+        tree.append(pid)
+        stack.extend(children.get(pid, []))
+    return tree
+
+
+def _signal_pid(pid: int, sig: int) -> None:
+    if pid == os.getpid():
+        return
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass  # it exited between the ps snapshot and now: nothing to stop
+
+
+def terminate_tree(proc: subprocess.Popen, grace: float = SIGTERM_GRACE_SECONDS) -> None:
+    """SIGTERM `proc` and its whole tree, wait `grace`, then SIGKILL the
+    survivors. The one cleanup path, for both a run deadline and a pier signal:
+    Pi stays in pier's process group, so a host timeout that kills pier must not
+    orphan Pi's children.
+
+    `proc` is pier's own unreaped child: os.kill(pid, 0) would report it alive as
+    a zombie until it is reaped, so its liveness is `proc.poll()`."""
+    pids = process_tree(proc.pid)
+    for pid in pids:
+        _signal_pid(pid, signal.SIGTERM)
+
+    def alive(pid: int) -> bool:
+        return proc.poll() is None if pid == proc.pid else pid_alive(pid)
+
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and any(alive(p) for p in pids):
+        time.sleep(0.05)
+    for pid in pids:
+        if alive(pid):
+            _signal_pid(pid, signal.SIGKILL)
+
+
 def _on_signal(signum: int, _frame: Any) -> None:
-    """Terminate Pi, wait briefly for it to exit, then kill it; a second signal
-    skips the grace period. Raising SystemExit unwinds through cmd_run's finally,
-    so the worktree is still cleaned up."""
+    """Terminate Pi and its descendants, wait briefly, then kill; a second
+    signal skips the grace period. Raising SystemExit unwinds through cmd_run's
+    finally, so the worktree is still cleaned up."""
     already = _stopping.is_set()
     _stopping.set()
     with _children_lock:
         procs = list(_children)
     for p in procs:
-        if p.poll() is None:
-            if already:
-                p.kill()
-            else:
-                p.terminate()
-    if not already:
-        deadline = time.monotonic() + SIGTERM_GRACE_SECONDS
-        for p in procs:
-            try:
-                p.wait(timeout=max(0.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                p.kill()
+        terminate_tree(p, 0 if already else SIGTERM_GRACE_SECONDS)
     raise SystemExit(128 + signum)
 
 
-def run_pi(cwd: Path, argv: List[str]) -> Tuple[int, str]:
+def run_pi(cwd: Path, argv: List[str], deadline: Optional[float] = None) -> Tuple[int, str]:
+    """Run Pi; after `deadline` (a time.monotonic() instant) kill its whole tree
+    and raise RunTimedOut."""
     if _stopping.is_set():
         raise PierError("pier is stopping")
     try:
@@ -270,7 +330,17 @@ def run_pi(cwd: Path, argv: List[str]) -> Tuple[int, str]:
         if _stopping.is_set():
             proc.terminate()
     try:
-        _, err = proc.communicate()
+        timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+        try:
+            _, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            terminate_tree(proc)
+            try:
+                _, err = proc.communicate(timeout=SIGTERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                _, err = proc.communicate()
+            raise RunTimedOut() from None
     finally:
         with _children_lock:
             _children.remove(proc)
@@ -312,18 +382,51 @@ def pi_argv(binary: str, home: Path, flags: List[str], session_args: List[str],
 
 
 def run_turn(home: Path, binary: str, sid: str, cwd: Path, flags: List[str],
-             session_args: List[str], prompt: str) -> Tuple[Outcome, Turn]:
+             session_args: List[str], prompt: str, ref: str,
+             deadline: float) -> Tuple[Outcome, Turn]:
+    """One Pi turn; `deadline` (time.monotonic()) raises RunTimedOut after the
+    tree kill. The run holds its slots throughout, and the pid is recorded before
+    the slot wait (so a queued run reads as running) and cleared either way, so
+    `send` can follow a timeout."""
     with tempfile.TemporaryDirectory(prefix="pier-") as tmp:
         argv = pi_argv(binary, home, flags, session_args,
                        prompt_args(prompt, Path(tmp) / "prompt.md", write=True))
         patch_sidecar(home, sid, pid=os.getpid(), pid_start=process_start(os.getpid()))
         try:
-            code, err = run_pi(cwd, argv)
+            with run_slots(home, ref, deadline):
+                code, err = run_pi(cwd, argv, deadline)
         finally:
             patch_sidecar(home, sid, pid=None, pid_start=None)
     sfile = find_session_file(home, sid)
     turn = last_turn(sfile) if sfile else Turn("", None, "")
     return turn_outcome(turn, code, err), turn
+
+
+def fmt_duration(ms: int) -> str:
+    """The deadline as minutes: 20m, 1.5m, 0.02m."""
+    return f"{round(ms / 60_000, 2):g}m"
+
+
+def timeout_outcome(ref: str, timeout_ms: int) -> Outcome:
+    """A timed-out run: no reply, exit 124, and the session is still sendable."""
+    return Outcome("", f'timed out after {fmt_duration(timeout_ms)} '
+                       f'(continue it: pier send {ref} "continue")', TIMEOUT_EXIT)
+
+
+def queued_timeout_outcome(timeout_ms: int) -> Outcome:
+    """A run that timed out waiting for a slot: Pi never started, so there is no
+    session to send to and no send hint."""
+    return Outcome("", f"timed out after {fmt_duration(timeout_ms)} waiting for a slot",
+                   TIMEOUT_EXIT)
+
+
+def interrupted_outcome(code: int) -> Outcome:
+    """A run cut short by a pier signal: exit 128+signum, as a shell reports it."""
+    try:
+        name = signal.Signals(code - 128).name
+    except ValueError:
+        name = f"signal {code - 128}"
+    return Outcome("", f"interrupted by {name}", code)
 
 
 def summary_line(ref: str, out: Outcome, name: Optional[str]) -> str:

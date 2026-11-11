@@ -38,12 +38,13 @@ Output:
 | `systemPromptMode` | `--system-prompt` / `--append-system-prompt` | `replace` (default) or `append` |
 | `skills` | repeated `--skill <resolved path>` | Names looked up in `.pi/skills`, `.agents/skills`, `~/.pi/agent/skills`, `~/.agents/skills`; anything else (package or settings skills) goes in `skillPath`. Empty list or `inheritSkills: false` = `--no-skills`. An unknown name is an error |
 | `skillPath` | repeated `--skill <path>` | Relative to the agent file's directory; absolute paths as is |
-| `extensions` | `--no-extensions` + repeated `--extension` | Empty list = only `--no-extensions`. Relative paths resolve against the agent file; `builtin:` `npm:` `git:` `http(s):` `file:` and absolute paths pass through |
+| `extensions` | `--no-extensions` + repeated `--extension` | Empty (`extensions:` or `[]`) = only `--no-extensions`. Relative paths resolve against the agent file; `builtin:` `npm:` `git:` `http(s):` `file:` and absolute paths pass through |
 | `subagentOnlyExtensions` | joins the `--extension` allowlist | Same rules as `extensions` |
 | `inheritProjectContext` | `--no-context-files` | Only when explicitly `false` |
 | `inheritSkills` | `--no-skills` | Only when explicitly `false` |
+| `timeoutMs` | none (pier kills Pi at the deadline) | Positive integer of milliseconds; default 20 minutes. Past it pier stops the run (and every process Pi started), exits 124, and the session stays sendable with `pier send <ref> "continue"` |
 
-`advertise`, `async`, `inheritGlobalContext`, `launcher`, `timeoutMs`, `acceptance*`,
+`advertise`, `async`, `inheritGlobalContext`, `launcher`, `acceptance*`,
 `memory`, `output`, nesting fields and anything else are **ignored and have no
 effect**. `pier agents validate` and `--dry-run` list them.
 

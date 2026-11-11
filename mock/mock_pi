@@ -18,6 +18,7 @@ Env: MOCK_PI_RECORD (file, last argv), MOCK_PI_RECORD_DIR (one file per call),
 MOCK_PI_RECORD_CWD (file, the cwd each call runs in),
 MOCK_PI_FAIL=1, MOCK_PI_FAIL_ON=<substring of prompt>, MOCK_PI_SLEEP=<s>,
 MOCK_PI_SLEEP_ON=<substring>, MOCK_PI_REPLY=<text>,
+MOCK_PI_CHILD=1 (spawn a sleeping grandchild, its pid in MOCK_PI_CHILD_PID),
 MOCK_PI_STOP=error|aborted|length (final assistant stopReason; error/aborted first write
 an intermediate "let me look" text + tool call, as a real failing turn can; print mode
 then exits 1, JSON mode exits 0 like real Pi).
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -140,6 +142,12 @@ def main() -> int:
     sleep = float(os.environ.get("MOCK_PI_SLEEP") or 0)
     if os.environ.get("MOCK_PI_SLEEP_ON") and os.environ["MOCK_PI_SLEEP_ON"] in prompt:
         sleep = max(sleep, 30.0)
+    if os.environ.get("MOCK_PI_CHILD") == "1":
+        # A tool subprocess that outlives its parent unless pier kills the tree.
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        pid_file = os.environ.get("MOCK_PI_CHILD_PID")
+        if pid_file:
+            Path(pid_file).write_text(str(child.pid), encoding="utf-8")
     if sleep:
         time.sleep(sleep)
 

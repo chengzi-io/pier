@@ -2,20 +2,36 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 STDERR_TAIL_CHARS = 600
+DEFAULT_MAX_RUNNING = 8
+DEFAULT_MAX_RUNNING_PER_SESSION = 4
+SLOT_POLL_SECONDS = 1.0
 
 
 class PierError(Exception):
     """User-facing error; the CLI prints `pier: error: ...` and exits 2."""
+
+
+class RunTimedOut(Exception):
+    """The run deadline passed: Pi was killed mid-run."""
+
+
+class SlotWaitTimedOut(RunTimedOut):
+    """The deadline passed while waiting for a run slot, so Pi never started:
+    there is no Pi session file for `send` to continue."""
+
 
 # ---------------------------------------------------------------------------
 # Paths / small helpers
@@ -193,6 +209,125 @@ def session_lock(home: Path, sid: str) -> Iterator[None]:
         return
     raise PierError(f"cannot lock session {sid_to_ref(sid)} ({lock})")
 
+# ---------------------------------------------------------------------------
+# Run slots: the concurrency caps, as advisory flocks on files under
+# $PIER_HOME/locks. The kernel releases a flock when its process dies, so a
+# killed pier never leaves a slot taken.
+# ---------------------------------------------------------------------------
+
+
+def max_running() -> int:
+    """Global cap on concurrent Pi runs: PIER_MAX_RUNNING, default 8."""
+    return _env_limit("PIER_MAX_RUNNING", DEFAULT_MAX_RUNNING)
+
+
+def max_running_per_session() -> int:
+    """Cap on runs one calling agent session starts: PIER_MAX_RUNNING_PER_SESSION."""
+    return _env_limit("PIER_MAX_RUNNING_PER_SESSION", DEFAULT_MAX_RUNNING_PER_SESSION)
+
+
+def _env_limit(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        raise PierError(f"{name}: {raw!r} is not an integer") from None
+    if n < 1:
+        raise PierError(f"{name}: must be >= 1")
+    return n
+
+
+def check_run_limits() -> None:
+    """Reject a bad cap before anything runs (like max_chars for PIER_MAX_CHARS)."""
+    max_running()
+    max_running_per_session()
+
+
+def caller_session_id() -> Optional[str]:
+    """The calling agent session, when the host names one (Claude Code sets
+    CLAUDE_CODE_SESSION_ID). Without it only the global cap applies."""
+    sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    return sid or None
+
+
+def slot_files(home: Path, group: str, cap: int) -> List[Path]:
+    d = ensure_dir(home / "locks" / group)
+    return [d / f"{i}.lock" for i in range(cap)]
+
+
+def _try_slot(files: List[Path]) -> Optional[int]:
+    """Take one free slot; the fd holds the lock until it is closed. Only
+    EWOULDBLOCK means the slot is taken: any other error is a real failure."""
+    for p in files:
+        fd = os.open(str(p), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            continue
+        except OSError as exc:
+            os.close(fd)
+            raise PierError(f"cannot lock run slot {p}: {exc}") from None
+        return fd
+    return None
+
+
+def running_count(files: List[Path]) -> int:
+    """How many of these slots other processes hold right now."""
+    n = 0
+    for p in files:
+        fd = os.open(str(p), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            n += 1
+        finally:
+            os.close(fd)
+    return n
+
+
+def _acquire_slot(home: Path, group: str, cap: int, ref: str,
+                  deadline: float) -> int:
+    files = slot_files(home, group, cap)
+    waited = False
+    while True:
+        fd = _try_slot(files)
+        if fd is not None:
+            return fd
+        if time.monotonic() >= deadline:
+            raise SlotWaitTimedOut() from None
+        if not waited:
+            print(f"pier: {ref} waiting for a slot ({running_count(files)} running)",
+                  file=sys.stderr, flush=True)
+            waited = True
+        time.sleep(SLOT_POLL_SECONDS)
+
+
+@contextlib.contextmanager
+def run_slots(home: Path, ref: str, deadline: float) -> Iterator[None]:
+    """Hold one caller-session slot, then one global slot, for one Pi run.
+    Waiting mentions it once and polls; the caller's deadline keeps running
+    meanwhile, so a queued run can still time out."""
+    groups: List[Tuple[str, int]] = []
+    sid = caller_session_id()
+    if sid:
+        key = hashlib.sha256(sid.encode("utf-8")).hexdigest()[:16]
+        groups.append((f"session-{key}", max_running_per_session()))
+    groups.append(("global", max_running()))
+    held: List[int] = []
+    try:
+        for group, cap in groups:
+            held.append(_acquire_slot(home, group, cap, ref, deadline))
+        yield
+    finally:
+        # Reverse acquisition order, so a waiter never takes the caller-session
+        # slot while the global one is still held and waits (and prints) twice.
+        for fd in reversed(held):
+            os.close(fd)
+
 
 def resolve_ref(home: Path, ref: str) -> str:
     """A ref (8-char uuid prefix, or the full uuid) -> sid."""
@@ -308,11 +443,15 @@ def patch_sidecar(home: Path, sid: str, **fields: Any) -> None:
 
 
 def start_session(home: Path, sid: str, cwd: Path, flags: List[str],
-                  agent: str, wt: Optional[Dict[str, str]]) -> None:
+                  agent: str, wt: Optional[Dict[str, str]],
+                  timeout_ms: Optional[int] = None) -> None:
     """Persist the sidecar before Pi starts, so a killed run can still be sent
     to or read back. The recorded cwd is the directory Pi runs in: the worktree
-    when `wt` is set, so `send` keeps the same isolation."""
+    when `wt` is set, so `send` keeps the same isolation. `timeout_ms` is the
+    run's deadline, replayed by `send`. """
     data: Dict[str, Any] = {"cwd": str(cwd), "flags": flags, "agent": agent}
+    if timeout_ms is not None:
+        data["timeout_ms"] = timeout_ms
     if wt:
         data.update(worktree=wt["worktree"], start_head=wt["start_head"],
                     origin_cwd=wt["origin_cwd"])

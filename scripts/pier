@@ -17,10 +17,13 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from pier_agents import (collect_agents, load_agent_file,
                          resolve_agent, validate_agent_text)
-from pi_runtime import (RunSpec, _on_signal, build_flags, max_chars, pi_argv,
-                        prompt_args, report, resolve_pi_binary, resolve_spec,
-                        run_turn, summary_line)
-from pi_state import (FAILED_STOPS, PierError, cleanup_worktree,
+from pi_runtime import (DEFAULT_TIMEOUT_MS, RunSpec, _on_signal, build_flags,
+                        interrupted_outcome, max_chars, pi_argv, prompt_args,
+                        queued_timeout_outcome, report, resolve_pi_binary,
+                        resolve_spec, run_turn, summary_line, timeout_outcome)
+from pi_state import (FAILED_STOPS, PierError, RunTimedOut, SlotWaitTimedOut,
+                      check_run_limits,
+                      cleanup_worktree,
                       ensure_not_running, find_session_file, fmt_age,
                       fmt_tokens, iter_sidecars, last_turn, load_sidecar,
                       make_worktree, pier_home, resolve_ref, restore_project_cwd,
@@ -91,6 +94,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         print_dry_run(cwd, notes, home, flags, ["--session-id", "<new-session-id>"], spec.task)
         return 0
     budget = max_chars()
+    check_run_limits()
+    timeout_ms = spec.timeout_ms
+    deadline = time.monotonic() + timeout_ms / 1000
     binary = resolve_pi_binary()
     sid = str(uuid.uuid4())
     ref = sid_to_ref(sid)
@@ -99,9 +105,19 @@ def cmd_run(args: argparse.Namespace) -> int:
         if args.worktree:
             wt = make_worktree(home, ref, spec.cwd)
             spec.cwd = Path(wt["worktree"])
-        start_session(home, sid, spec.cwd, flags, spec.agent.name, wt)
+        start_session(home, sid, spec.cwd, flags, spec.agent.name, wt, timeout_ms)
         print(f"pier: {ref} started ({spec.agent.name})", file=sys.stderr, flush=True)
-        out, _ = run_turn(home, binary, sid, spec.cwd, flags, ["--session-id", sid], spec.task)
+        try:
+            out, _ = run_turn(home, binary, sid, spec.cwd, flags, ["--session-id", sid],
+                              spec.task, ref, deadline)
+        except SlotWaitTimedOut:
+            out = queued_timeout_outcome(timeout_ms)
+        except RunTimedOut:
+            out = timeout_outcome(ref, timeout_ms)
+    except SystemExit as exc:
+        # A pier signal (_on_signal): still report the run as failed, then exit
+        # 128+signum through the summary below.
+        out = interrupted_outcome(exc.code if isinstance(exc.code, int) else 1)
     finally:
         # Before the summary: cleanup can print, and the last stderr line stays
         # the summary.
@@ -133,6 +149,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     sid = resolve_ref(home, args.session)
     side = load_sidecar(home, sid)
     ref = sid_to_ref(sid)
+    ensure_not_running(ref, side)  # before the task is read: a busy session takes no input
     task = read_task(list(args.words))
     sfile = find_session_file(home, sid)
     if not sfile:
@@ -145,11 +162,24 @@ def cmd_send(args: argparse.Namespace) -> int:
     if not cwd.is_dir():
         raise PierError(f"session {ref} cwd is gone: {cwd}")
     budget = max_chars()
-    ensure_not_running(ref, side)
+    check_run_limits()
+    timeout_ms = side.get("timeout_ms")
+    if not isinstance(timeout_ms, int) or timeout_ms <= 0:
+        timeout_ms = DEFAULT_TIMEOUT_MS
+    deadline = time.monotonic() + timeout_ms / 1000
     binary = resolve_pi_binary()
-    with session_lock(home, sid):
-        ensure_not_running(ref, load_sidecar(home, sid))  # a run may have started since
-        out, _ = run_turn(home, binary, sid, cwd, side["flags"], ["--session", str(sfile)], task)
+    try:
+        with session_lock(home, sid):
+            ensure_not_running(ref, load_sidecar(home, sid))  # a run may have started since
+            try:
+                out, _ = run_turn(home, binary, sid, cwd, side["flags"],
+                                  ["--session", str(sfile)], task, ref, deadline)
+            except SlotWaitTimedOut:
+                out = queued_timeout_outcome(timeout_ms)
+            except RunTimedOut:
+                out = timeout_outcome(ref, timeout_ms)
+    except SystemExit as exc:
+        out = interrupted_outcome(exc.code if isinstance(exc.code, int) else 1)
     print(summary_line(ref, out, side.get("agent")), file=sys.stderr)
     return report(out, home, sid, budget)
 
@@ -237,7 +267,8 @@ class _Parser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     p = _Parser(prog="pier", description="Run named Pi subagents from agent Markdown files. "
                 "Every run is synchronous and prints only the reply on stdout. "
-                "Env: PI_BIN, PIER_HOME, PIER_MAX_CHARS.")
+                "Env: PI_BIN, PIER_HOME, PIER_MAX_CHARS, PIER_MAX_RUNNING, "
+                "PIER_MAX_RUNNING_PER_SESSION.")
     p.add_argument("--version", action="version", version=f"pier {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
 

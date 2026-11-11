@@ -107,10 +107,26 @@ Pi runs often take minutes. If the host can run a command in the background (Cla
 Code: Bash with `run_in_background`), use that instead of a long foreground timeout.
 Independent tasks can run in parallel, one `pier run` each.
 
-Pi runs in pier's process group, and pier terminates it on `SIGTERM`, `SIGHUP` or
-`SIGINT`, so a host timeout never leaves Pi running with nobody to read its reply. The
-session keeps everything up to the interruption: `pier send REF "continue"`. `SIGKILL`
-cannot be intercepted; if only pier's pid gets it, Pi runs to completion.
+Pi runs in pier's process group, and pier terminates it — and every process Pi started —
+on `SIGTERM`, `SIGHUP` or `SIGINT`, so a host timeout never leaves Pi running with
+nobody to read its reply. pier then exits 128+signal, after `pier: <ref> failed (<agent>)`
+and `pier: error: interrupted by SIGTERM` on stderr. The session keeps everything up to
+the interruption: `pier send REF "continue"`. `SIGKILL` cannot be intercepted; if only
+pier's pid gets it, Pi runs to completion.
+
+Every run also has a deadline: `timeoutMs` in the agent file, 20 minutes when the field
+is absent. When it passes, pier kills Pi's process tree, exits 124, and leaves the
+session sendable: `pier send REF "continue"`. `send` reuses the deadline of the run that
+created the session.
+
+Concurrency is capped so parallel delegation cannot swamp the machine: `PIER_MAX_RUNNING`
+runs at a time (default 8), and `PIER_MAX_RUNNING_PER_SESSION` per calling agent session
+(default 4, keyed by `CLAUDE_CODE_SESSION_ID`; without that variable only the global cap
+applies). A run that has to queue says so once on stderr
+(`pier: <ref> waiting for a slot (<n> running)`) and starts when a slot frees up; the
+queue time counts toward its deadline. A run that times out while still queued exits 124
+with `pier: error: timed out after <N>m waiting for a slot`: Pi never started, so there
+is no session to `send` to.
 
 ### Isolation: `--worktree`
 
@@ -127,16 +143,18 @@ session under its project.
 ```markdown
 ---
 name: reviewer
-description: Code review focused on correctness, security, and clarity. Read-mostly.
+description: Reviews a change and reports only problems backed by evidence. Never edits files.
 tools: read, grep, find, ls, bash
 excludeTools: write, edit
 thinking: medium
+systemPromptMode: append
 ---
 
-You are a rigorous code reviewer. ...
+You review the change the task names (a diff, commit range or files). ...
 ```
 
-The body becomes Pi's system prompt. [Writing agent files](references/agent-authoring.md)
+The body is appended to Pi's system prompt (`systemPromptMode: append`) or replaces it
+(the default). [Writing agent files](references/agent-authoring.md)
 covers every field; examples live in [`agents/`](agents/).
 
 Lookup order, lowest to highest priority (a later directory wins on the same name):
@@ -161,8 +179,9 @@ pier never reads pi-subagents directories (`~/.pi/agent/agents`, `.pi/agents`, `
 | `systemPromptMode` | `replace` (default) = `--system-prompt`; `append` = `--append-system-prompt` |
 | `skills` | repeated `--skill <resolved path>`; empty or `inheritSkills: false` = `--no-skills` |
 | `skillPath` | repeated `--skill <path>`, relative to the agent file |
-| `extensions`, `subagentOnlyExtensions` | `--no-extensions` + repeated `--extension`; empty `extensions` = `--no-extensions` only |
+| `extensions`, `subagentOnlyExtensions` | `--no-extensions` + repeated `--extension`; empty `extensions` (or `[]`) = `--no-extensions` only |
 | `inheritProjectContext: false` | `--no-context-files` |
+| `timeoutMs` | none: pier's run deadline (default 20 minutes; exit 124 when it passes) |
 | anything else, including `advertise` / `async` | ignored, no effect (`validate` and `--dry-run` list it) |
 
 `tools` entries reach Pi unchanged. Pi accepts built-in, extension and custom tool
@@ -189,6 +208,9 @@ file passed as `@path`.
 | Reply cut off at the token limit | partial reply | `pier: error: … (continue it: pier send <ref> "continue")` | Pi's code, else 1 |
 | Turn ended on a tool call with no answer (Pi exited mid-turn) | — | `pier: error: turn ended at a tool call …` | Pi's code, else 1 |
 | Pi exited non-zero | — | `pier: error: pi exited N: <stderr tail>` | N |
+| Run deadline passed (`timeoutMs`, default 20 min) | — | `pier: error: timed out after <N>m (continue it: pier send <ref> "continue")` | 124 |
+| Run deadline passed while waiting for a slot (Pi never started) | — | `pier: error: timed out after <N>m waiting for a slot` | 124 |
+| Interrupted by `SIGTERM`, `SIGHUP` or `SIGINT` | — | `pier: <ref> failed (agent)` then `pier: error: interrupted by SIGTERM` | 128+signal |
 | Session busy (turn running, or another `send` holds it) | — | `pier: error: session <ref> is running / is already in use …` | 2 |
 | Invalid arguments, unknown agent or session, Pi not found | — | `pier: error: …` | 2 |
 
@@ -209,8 +231,9 @@ pier writes only these:
 
 | Path | Content | When |
 |---|---|---|
-| `$PIER_HOME/sessions/<sid>.pier.json` | cwd, Pi flags, agent, pid + start time, worktree | before Pi starts |
+| `$PIER_HOME/sessions/<sid>.pier.json` | cwd, Pi flags, agent, timeout, pid + start time, worktree | before Pi starts |
 | `$PIER_HOME/sessions/<sid>.lock` | pid of the `send` that holds the session | while `send` runs |
+| `$PIER_HOME/locks/**/*.lock` | one empty file per run slot, held with `flock` | while runs are live |
 | `$PIER_HOME/sessions/<time>_<sid>.jsonl` | Pi's own session file | while Pi runs |
 | `$PIER_HOME/out/<sid>.md` | over-budget reply | on spill |
 | `$PIER_HOME/worktrees/<ref>/` | `--worktree` checkout | while the session runs; kept when changed |
@@ -231,6 +254,8 @@ Old files under `$PIER_HOME` can be deleted once their sessions are done.
 | `PI_BIN` | `pi` | Pi executable |
 | `PIER_HOME` | `~/.pier` | Sessions, spilled replies, worktrees, user agents |
 | `PIER_MAX_CHARS` | `24000` | Reply budget on stdout |
+| `PIER_MAX_RUNNING` | `8` | Concurrent Pi runs across all callers |
+| `PIER_MAX_RUNNING_PER_SESSION` | `4` | Concurrent runs from one `CLAUDE_CODE_SESSION_ID` (ignored when unset) |
 
 ### Design notes
 

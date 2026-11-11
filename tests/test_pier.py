@@ -6,6 +6,7 @@ Pi binary with an empty HOME (no credentials -> no model call).
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shlex
@@ -44,7 +45,9 @@ class Base(unittest.TestCase):
             "MOCK_PI_RECORD_DIR": str(self.rec_dir),
         }
         for k in ("PIER_HOME", "MOCK_PI_FAIL", "MOCK_PI_FAIL_ON",
-                  "MOCK_PI_SLEEP", "MOCK_PI_SLEEP_ON", "MOCK_PI_REPLY"):
+                  "MOCK_PI_SLEEP", "MOCK_PI_SLEEP_ON", "MOCK_PI_REPLY",
+                  "MOCK_PI_CHILD", "MOCK_PI_CHILD_PID", "CLAUDE_CODE_SESSION_ID",
+                  "PIER_MAX_RUNNING", "PIER_MAX_RUNNING_PER_SESSION"):
             self.env[k] = ""
 
     def tearDown(self):
@@ -233,14 +236,14 @@ class DiscoveryTests(Base):
     def test_unknown_agent_lists_available(self):
         r = self.pier("run", "nope", "t")
         self.assertEqual(r.returncode, 2)
-        for n in ("explorer", "planner", "reviewer", "worker"):
+        for n in ("chore", "debugger", "librarian", "researcher", "reviewer", "worker"):
             self.assertIn(n, r.stderr)
         self.assertEqual(self.calls(), [])
 
     def test_list_is_toon_table(self):
         r = self.pier("agents", "list")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue(r.stdout.startswith("[4]{name,model,description}:"), r.stdout)
+        self.assertTrue(r.stdout.startswith("[6]{name,model,description}:"), r.stdout)
         self.assertIn('\n  reviewer,"",', r.stdout)  # no model: Pi's default
         self.write_agent(".pier/agents/m.md", "---\nname: m\nmodel: zai/glm:low\n---\nB\n")
         self.assertIn('\n  m,"zai/glm:low",', self.pier("agents", "list").stdout)
@@ -256,7 +259,7 @@ class DiscoveryTests(Base):
     def test_show_prints_path_and_file(self):
         r = self.pier("agents", "show", "reviewer")
         self.assertEqual(r.stdout.splitlines()[0], str(ROOT / "agents" / "reviewer.md"))
-        self.assertIn("You are a rigorous code reviewer.", r.stdout)
+        self.assertIn("You review the change specified by the task", r.stdout)
 
 
 class MappingTests(Base):
@@ -330,7 +333,7 @@ class MappingTests(Base):
         # Pi's --tools keeps MCP tools callable from codemode scripts whatever the
         # list says; turning MCP off is `excludeTools: mcp__*` (tools) or
         # `--no-mcp` (server connections), never an implicit side effect.
-        self.assertNotIn("--no-mcp", self.dry("run", "explorer", "go"))
+        self.assertNotIn("--no-mcp", self.dry("run", "librarian", "go"))
         self.write_agent(".pier/agents/t.md", "---\nname: t\ntools:\n---\nB\n")
         a = self.dry("run", "t", "go")
         self.assertIn("--no-tools", a)
@@ -442,7 +445,7 @@ class SessionTests(Base):
         sid = self.sid_of(r)
         side = json.loads((self.state() / "sessions" / f"{sid}.pier.json").read_text())
         self.assertEqual(side["cwd"], str(self.proj.resolve()))
-        self.assertIn("--system-prompt", side["flags"])
+        self.assertIn("--append-system-prompt", side["flags"])
         self.assertEqual(flag(self.argv(), "--session-id"), sid)
 
     def test_failure_exit_code_and_stderr(self):
@@ -790,6 +793,298 @@ class SessionTests(Base):
         self.assertIn("no sessions", self.pier("ps", cwd=other).stderr)
 
 
+class RunControlTests(Base):
+    """Run deadline (timeoutMs) and the concurrency caps."""
+
+    def slow_agent(self, ms=1500):
+        return self.write_agent(".pier/agents/slow.md",
+                                f"---\nname: slow\ntimeoutMs: {ms}\n---\nSLOW ROLE\n")
+
+    def spawn_run(self, *args, env=None):
+        p = subprocess.Popen([sys.executable, str(PIER), *args], cwd=str(self.proj),
+                             env=self.full_env(env), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.stop, p)
+        return p
+
+    def stop(self, p):
+        if p.poll() is None:
+            p.send_signal(signal.SIGTERM)
+            p.wait(timeout=15)
+        for f in (p.stdout, p.stderr):
+            if f and not f.closed:
+                f.close()
+
+    def child_pid(self, path, timeout=15):
+        """Wait for mock Pi's grandchild to write its pid."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if path.is_file() and path.read_text(encoding="utf-8").strip():
+                return int(path.read_text(encoding="utf-8"))
+            time.sleep(0.05)
+        self.fail("mock Pi never spawned its grandchild")
+
+    def assert_gone(self, pid, timeout=15):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        self.fail(f"pid {pid} is still alive")
+
+    def test_timeout_kills_pi_tree_and_keeps_session_sendable(self):
+        self.slow_agent(1000)
+        kid_pid = self.tmp / "kid.pid"
+        r = self.pier("run", "slow", "x", env={"MOCK_PI_SLEEP": "30", "MOCK_PI_CHILD": "1",
+                                                 "MOCK_PI_CHILD_PID": str(kid_pid)})
+        self.assertEqual(r.returncode, 124, r.stderr)
+        self.assertEqual(r.stdout, "")
+        ref = self.ref_of(r)
+        self.assertEqual(r.stderr.splitlines()[:2],
+                         [f"pier: {ref} started (slow)", f"pier: {ref} failed (slow)"])
+        self.assertEqual(r.stderr.splitlines()[-1],
+                         f'pier: error: timed out after 0.02m '
+                         f'(continue it: pier send {ref} "continue")')
+        self.assert_gone(self.child_pid(kid_pid))
+        # the sidecar keeps the timeout, and the session is still usable
+        sid = self.sid_of(r)
+        side = json.loads((self.sidecar_dir() / f"{sid}.pier.json").read_text())
+        self.assertEqual(side["timeout_ms"], 1000)
+        r = self.pier("send", sid, "continue")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("[resumed", r.stdout)
+
+    def test_timeout_kill_does_not_wait_out_the_grace(self):
+        # Pi is pier's unreaped child: once SIGTERM killed it, it is a zombie and
+        # os.kill(pid, 0) still says alive, so the kill must not wait the full 5 s.
+        self.slow_agent(1000)
+        start = time.monotonic()
+        r = self.pier("run", "slow", "x", env={"MOCK_PI_SLEEP": "30"})
+        elapsed = time.monotonic() - start
+        self.assertEqual(r.returncode, 124, r.stderr)
+        self.assertLess(elapsed, 3.0)  # before: ~1 s + the 5 s grace
+
+    def test_timeout_is_stored_and_replayed_by_send(self):
+        self.write_agent(".pier/agents/t.md", "---\nname: t\ntimeoutMs: 1000\n---\nT\n")
+        sid = self.sid_of(self.pier("run", "t", "x"))
+        side = json.loads((self.sidecar_dir() / f"{sid}.pier.json").read_text())
+        self.assertEqual(side["timeout_ms"], 1000)
+        r = self.pier("send", sid, "slow again", env={"MOCK_PI_SLEEP": "30"})
+        self.assertEqual(r.returncode, 124, r.stderr)
+        self.assertIn("timed out after 0.02m", r.stderr)
+
+    def test_default_timeout_is_twenty_minutes(self):
+        sid = self.sid_of(self.pier("run", "reviewer", "x"))
+        side = json.loads((self.sidecar_dir() / f"{sid}.pier.json").read_text())
+        self.assertEqual(side["timeout_ms"], pi_runtime.DEFAULT_TIMEOUT_MS)
+        self.assertEqual(pi_runtime.DEFAULT_TIMEOUT_MS, 20 * 60 * 1000)
+
+    def test_sigterm_takes_the_grandchild_too(self):
+        kid_pid = self.tmp / "kid.pid"
+        p = self.spawn_run("run", "reviewer", "x",
+                           env={"MOCK_PI_SLEEP": "30", "MOCK_PI_CHILD": "1",
+                                "MOCK_PI_CHILD_PID": str(kid_pid)})
+        kid = self.child_pid(kid_pid)
+        p.send_signal(signal.SIGTERM)
+        self.assertEqual(p.wait(timeout=15), 128 + signal.SIGTERM)
+        self.assert_gone(kid)
+
+    def test_sigterm_still_ends_with_the_failed_summary(self):
+        p = self.spawn_run("run", "reviewer", "x", env={"MOCK_PI_SLEEP": "30"})
+        self.wait_for_running_pid()
+        p.send_signal(signal.SIGTERM)
+        out, err = p.communicate(timeout=20)
+        self.assertEqual(p.returncode, 128 + signal.SIGTERM, err)
+        self.assertEqual(out, "")
+        lines = err.splitlines()
+        ref = lines[0].split()[1]
+        self.assertEqual(lines[0], f"pier: {ref} started (reviewer)")
+        self.assertEqual(lines[-2:], [f"pier: {ref} failed (reviewer)",
+                                      "pier: error: interrupted by SIGTERM"])
+
+    def test_validate_rejects_a_bad_timeout(self):
+        p = self.tmp / "bad-timeout.md"
+        for raw in ("0", "-5", "soon", "1.5"):
+            p.write_text(f"---\nname: x\ndescription: d\ntimeoutMs: {raw}\n---\nROLE\n")
+            r = self.pier("agents", "validate", str(p))
+            self.assertEqual(r.returncode, 1, raw)
+            self.assertIn("timeoutMs", r.stdout)
+        p.write_text("---\nname: x\ndescription: d\ntimeoutMs: 1500\n---\nROLE\n")
+        r = self.pier("agents", "validate", str(p))
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("ignored", r.stdout)
+
+    def test_global_cap_makes_the_second_run_wait(self):
+        p = self.spawn_run("run", "reviewer", "first",
+                           env={"MOCK_PI_SLEEP": "3", "PIER_MAX_RUNNING": "1"})
+        self.wait_for_running_pid()  # the slow run holds the only slot
+        r = self.pier("run", "reviewer", "second", env={"PIER_MAX_RUNNING": "1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        ref = self.ref_of(r)
+        lines = r.stderr.splitlines()
+        self.assertEqual(lines[0], f"pier: {ref} started (reviewer)")
+        self.assertRegex(lines[1], rf"^pier: {ref} waiting for a slot \(1 running\)$")
+        self.assertEqual(lines[-1], f"pier: {ref} ok (reviewer)")
+        self.assertEqual(r.stdout, "mock-ok: second\n")
+        self.assertEqual(p.wait(timeout=20), 0)
+        p.stdout.close()
+        p.stderr.close()
+
+    def test_per_session_cap_keys_on_claude_code_session_id(self):
+        env = {"MOCK_PI_SLEEP": "3", "CLAUDE_CODE_SESSION_ID": "caller-a",
+               "PIER_MAX_RUNNING_PER_SESSION": "1"}
+        p = self.spawn_run("run", "reviewer", "first", env=env)
+        self.wait_for_running_pid()
+        r = self.pier("run", "reviewer", "second", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("waiting for a slot", r.stderr)
+        # another caller session has its own slots: no wait
+        r = self.pier("run", "reviewer", "third",
+                      env={"CLAUDE_CODE_SESSION_ID": "caller-b",
+                           "PIER_MAX_RUNNING_PER_SESSION": "1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("waiting for a slot", r.stderr)
+        self.assertEqual(p.wait(timeout=20), 0)
+        p.stdout.close()
+        p.stderr.close()
+
+    def test_global_cap_applies_without_a_caller_session(self):
+        env = {"MOCK_PI_SLEEP": "2", "PIER_MAX_RUNNING_PER_SESSION": "1"}
+        p = self.spawn_run("run", "reviewer", "first", env=env)
+        self.wait_for_running_pid()
+        # no CLAUDE_CODE_SESSION_ID: the per-session cap cannot apply
+        r = self.pier("run", "reviewer", "second", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("waiting for a slot", r.stderr)
+        self.assertEqual(p.wait(timeout=20), 0)
+        p.stdout.close()
+        p.stderr.close()
+
+    def test_bad_cap_env_is_rejected_before_pi_runs(self):
+        for key, raw in (("PIER_MAX_RUNNING", "0"), ("PIER_MAX_RUNNING", "lots"),
+                         ("PIER_MAX_RUNNING_PER_SESSION", "-1")):
+            r = self.pier("run", "reviewer", "x", env={key: raw})
+            self.assertEqual(r.returncode, 2, raw)
+            self.assertIn(key, r.stderr)
+            r = self.pier("send", "deadbeef", "x", env={key: raw})
+            self.assertEqual(r.returncode, 2, raw)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.sidecar_dir().exists())
+
+    def test_dry_run_takes_no_slot_and_sets_no_timeout(self):
+        self.slow_agent(1000)
+        a = self.dry("run", "slow", "x")
+        self.assertEqual(a[0], str(MOCK))
+        self.assertFalse(self.state().exists())  # no lock files, no sidecar
+
+    def test_waiting_for_a_slot_counts_toward_the_timeout(self):
+        self.slow_agent(1000)
+        p = self.spawn_run("run", "reviewer", "first",
+                           env={"MOCK_PI_SLEEP": "5", "PIER_MAX_RUNNING": "1"})
+        self.wait_for_running_pid()
+        r = self.pier("run", "slow", "queued", env={"PIER_MAX_RUNNING": "1"})
+        self.assertEqual(r.returncode, 124, r.stderr)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("waiting for a slot", r.stderr)
+        # Pi never started, so there is no Pi session for a send hint to reach
+        self.assertEqual(r.stderr.splitlines()[-1],
+                         "pier: error: timed out after 0.02m waiting for a slot")
+        self.assertEqual(p.wait(timeout=20), 0)
+        p.stdout.close()
+        p.stderr.close()
+
+    def test_a_queued_run_reads_as_running(self):
+        busy = self.spawn_run("run", "reviewer", "first",
+                              env={"MOCK_PI_SLEEP": "6", "PIER_MAX_RUNNING": "1"})
+        self.wait_for_running_pid()
+        queued = self.spawn_run("run", "reviewer", "second",
+                                env={"MOCK_PI_SLEEP": "1", "PIER_MAX_RUNNING": "1"})
+        first = queued.stderr.readline()
+        self.assertIn("waiting for a slot", queued.stderr.readline())  # it is queued now
+        ref = first.split()[1]
+        r = self.pier("ps", ref)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("running", r.stdout)  # not `failed` while it queues
+        r = self.pier("send", ref, "x")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("is running", r.stderr)
+        self.assertEqual(queued.wait(timeout=30), 0)
+        self.assertEqual(busy.wait(timeout=30), 0)
+
+
+class SlotLockTests(Base):
+    """Run slot flocks, in-process: release order and flock error handling."""
+
+    def caller_session(self, sid="caller-a"):
+        prev = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        os.environ["CLAUDE_CODE_SESSION_ID"] = sid
+
+        def restore():
+            if prev is None:
+                os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            else:
+                os.environ["CLAUDE_CODE_SESSION_ID"] = prev
+        self.addCleanup(restore)
+
+    def test_slots_are_released_in_reverse_order(self):
+        # session slot first in, last out: otherwise a waiter takes the session
+        # slot while the global one is still held and waits (prints) twice
+        self.caller_session()
+        taken = []
+        closed = []
+        real_try, real_os = pi_state._try_slot, pi_state.os
+
+        def spy_try(files):
+            fd = real_try(files)
+            if fd is not None:
+                taken.append(fd)
+            return fd
+
+        class Os:
+            def __getattr__(self, name):
+                return getattr(real_os, name)
+
+            def close(self, fd):
+                closed.append(fd)
+                real_os.close(fd)
+
+        pi_state._try_slot, pi_state.os = spy_try, Os()
+        try:
+            with pi_state.run_slots(self.state(), "abc12345", time.monotonic() + 30):
+                pass
+        finally:
+            pi_state._try_slot, pi_state.os = real_try, real_os
+        self.assertEqual(len(taken), 2, "session slot then global slot")
+        self.assertEqual(closed, taken[::-1])
+
+    def test_a_held_slot_reads_as_taken(self):
+        home = self.state()
+        files = pi_state.slot_files(home, "global", 1)
+        with pi_state.run_slots(home, "abc12345", time.monotonic() + 30):
+            self.assertIsNone(pi_state._try_slot(files))
+
+    def test_a_flock_error_is_not_a_taken_slot(self):
+        files = pi_state.slot_files(self.state(), "global", 1)
+        real_fcntl = pi_state.fcntl
+
+        class Fcntl:
+            def __getattr__(self, name):
+                return getattr(real_fcntl, name)
+
+            def flock(self, fd, op):
+                raise OSError(errno.ENOLCK, "No locks available")
+
+        pi_state.fcntl = Fcntl()
+        try:
+            with self.assertRaises(pi_state.PierError) as ctx:
+                pi_state._try_slot(files)
+        finally:
+            pi_state.fcntl = real_fcntl
+        self.assertIn(str(files[0]), str(ctx.exception))
+
+
 class WorktreeTests(Base):
     def git(self, *args, cwd=None):
         r = subprocess.run(["git", *args], cwd=str(cwd or self.proj), capture_output=True,
@@ -958,11 +1253,16 @@ class StorageTests(Base):
         sid = self.sid_of(self.pier("run", "reviewer", "hello", cwd=other))
         self.assertFalse((self.proj / ".pier").exists())
         self.assertFalse((other / ".pier").exists())
-        files = sorted(str(p.relative_to(self.state())) for p in self.state().rglob("*") if p.is_file())
+        files = sorted(str(p.relative_to(self.state())) for p in self.state().rglob("*")
+                       if p.is_file() and not str(p.relative_to(self.state())).startswith("locks/"))
         self.assertEqual(len(files), 2, files)
         self.assertIn(f"sessions/{sid}.pier.json", files)
         pi_file = [f for f in files if f.endswith(".jsonl")][0]
         self.assertTrue(pi_file.startswith("sessions/") and pi_file.endswith(f"_{sid}.jsonl"))
+        # run slots are empty files under locks/, kept for the next run's flock
+        for p in (self.state() / "locks").rglob("*.lock"):
+            self.assertEqual(p.read_text(encoding="utf-8"), "")
+            self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600, p)
 
     def test_pier_home_override(self):
         alt = self.tmp / "alt"
@@ -1129,7 +1429,8 @@ class SystemPromptAndResourcesTests(Base):
 
     def test_report_contract_appended_after_role(self):
         # every run carries the ~60-token report contract, after the agent's own prompt
-        a = self.dry("run", "reviewer", "t")
+        self.write_agent(".pier/agents/r.md", "---\nname: r\n---\nREPLACE ME\n")
+        a = self.dry("run", "r", "t")
         appends = [v for f, v in zip(a, a[1:]) if f == "--append-system-prompt"]
         self.assertEqual(appends, [pi_runtime.REPORT_CONTRACT])
         self.assertLess(a.index("--system-prompt"), a.index("--append-system-prompt"))
@@ -1199,10 +1500,14 @@ class SystemPromptAndResourcesTests(Base):
         self.assertEqual(len(exts), 2)
         self.assertTrue(any(e.endswith("my-ext.ts") for e in exts))
         self.assertIn("builtin:foo", exts)
-        self.write_agent(".pier/agents/e2.md", "---\nname: e2\nextensions:\n---\nB\n")
-        a = self.dry("run", "e2", "t")
-        self.assertIn("--no-extensions", a)
-        self.assertNotIn("--extension", a)
+        for empty in ("", " []"):
+            self.write_agent(".pier/agents/e2.md", f"---\nname: e2\nextensions:{empty}\n---\nB\n")
+            a = self.dry("run", "e2", "t")
+            self.assertIn("--no-extensions", a)
+            self.assertNotIn("--extension", a)
+        self.write_agent(".pier/agents/e3.md", "---\nname: e3\ntools: [read, 'ls']\n---\nB\n")
+        a = self.dry("run", "e3", "t")
+        self.assertEqual(a[a.index("--tools") + 1], "read,ls")
 
     def test_inherit_project_context_false(self):
         self.write_agent(".pier/agents/c.md",
@@ -1217,18 +1522,27 @@ class RealPiArgvTests(Base):
     """Real Pi parses pier's argv; an empty Pi config dir + no key env -> fails only on
     the missing API key, so no model is called. HOME stays real for node shims."""
 
+    def real_run(self, *argv: str) -> subprocess.CompletedProcess:
+        clean = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", ""),
+                 "PI_BIN": os.environ["PIER_TEST_REAL_PI"],
+                 "PI_CODING_AGENT_DIR": str(self.tmp / "pi-agent"), "PIER_HOME": str(self.tmp / "pier-home")}
+        return subprocess.run([sys.executable, str(PIER), "run", *argv],
+                              cwd=str(self.proj), env=clean, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=60)
+
     def test_real_pi_accepts_argv(self):
-        real = os.environ["PIER_TEST_REAL_PI"]
         self.write_agent(".pier/agents/r.md", "---\nname: r\nmodel: anthropic/claude-sonnet-4-5:low\n"
                          "tools: read, grep\nexcludeTools: bash\n---\nRole \"q\" 中文\n")
-        clean = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", ""), "PI_BIN": real,
-                 "PI_CODING_AGENT_DIR": str(self.tmp / "pi-agent"), "PIER_HOME": str(self.tmp / "pier-home")}
-        r = subprocess.run([sys.executable, str(PIER), "run", "r", "task it's 中文"],
-                           cwd=str(self.proj), env=clean, stdin=subprocess.DEVNULL,
-                           capture_output=True, text=True, timeout=60)
+        r = self.real_run("r", "task it's 中文")
         self.assertNotIn("Unknown option", r.stderr)
         self.assertIn("No API key", r.stderr)
         self.assertEqual(r.returncode, 1)
+
+    def test_real_pi_accepts_bundled_agents(self):
+        for f in sorted((ROOT / "agents").glob("*.md")):
+            with self.subTest(agent=f.stem):
+                r = self.real_run(f.stem, "t", "--model", "anthropic/claude-sonnet-4-5")
+                self.assertIn("No API key", r.stderr)
 
 
 if __name__ == "__main__":

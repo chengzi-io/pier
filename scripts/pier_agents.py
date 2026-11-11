@@ -18,13 +18,13 @@ MAPPED_FIELDS = (
     "name", "tools", "excludeTools", "model", "thinking", "defaultProvider",
     "systemPromptMode", "skills", "skillPath",
     "extensions", "subagentOnlyExtensions",
-    "inheritProjectContext", "inheritSkills",
+    "inheritProjectContext", "inheritSkills", "timeoutMs",
 )
 # Selection / display only; never changes the Pi invocation.
 META_FIELDS = ("description",)
 # Identity is `name` only (no package/aliases). Other fields (advertise, async,
-# launcher, timeoutMs, acceptance*, memory, output, nested*, inheritGlobalContext,
-# ...) are ignored; `validate` and `--dry-run` report them.
+# launcher, acceptance*, memory, output, nested*, inheritGlobalContext, ...) are
+# ignored; `validate` and `--dry-run` report them.
 
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 THINKING_SUFFIX_RE = re.compile(rf":({'|'.join(THINKING_LEVELS)})\s*$", re.I)
@@ -36,6 +36,20 @@ FALSE_RE = re.compile(r"^(0|false|no|off)$", re.I)
 
 def ignored_fields(fm: Dict[str, str]) -> List[str]:
     return sorted(k for k in fm if k not in MAPPED_FIELDS and k not in META_FIELDS)
+
+
+def parse_timeout_ms(raw: Optional[str]) -> Optional[int]:
+    """`timeoutMs`: a positive integer of milliseconds; None when absent."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    try:
+        n = int(s)
+    except ValueError:
+        raise ValueError(f"timeoutMs {s!r} is not an integer (milliseconds)") from None
+    if n <= 0:
+        raise ValueError(f"timeoutMs {s!r} must be > 0 (milliseconds)")
+    return n
 
 
 def parse_bool(val: Optional[str]) -> Optional[bool]:
@@ -149,6 +163,9 @@ def _fold(block: str) -> str:
 def parse_list(raw: Optional[str]) -> Optional[List[str]]:
     if raw is None:
         return None
+    stripped = raw.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        raw = stripped[1:-1]
     out: List[str] = []
     for line in raw.split("\n"):
         v = line.strip()
@@ -187,6 +204,7 @@ class AgentDef:
     subagent_only_extensions: Optional[List[str]] = None
     inherit_project_context: Optional[bool] = None
     inherit_skills: Optional[bool] = None
+    timeout_ms: Optional[int] = None  # run deadline; None = pier's default
     ignored: List[str] = field(default_factory=list)  # frontmatter keys with no effect
 
 
@@ -224,6 +242,10 @@ def load_agent_file(path: Path) -> AgentDef:
     skill_paths = parse_list(fm["skillPath"]) if "skillPath" in fm else None
     extensions = parse_list(fm["extensions"]) if "extensions" in fm else None
     soe = parse_list(fm["subagentOnlyExtensions"]) if "subagentOnlyExtensions" in fm else None
+    try:
+        timeout_ms = parse_timeout_ms(fm.get("timeoutMs"))
+    except ValueError as exc:
+        raise PierError(f"{path}: {exc}") from None
     return AgentDef(
         name=name,
         path=path.resolve(),
@@ -241,6 +263,7 @@ def load_agent_file(path: Path) -> AgentDef:
         subagent_only_extensions=soe,
         inherit_project_context=parse_bool(fm.get("inheritProjectContext")),
         inherit_skills=parse_bool(fm.get("inheritSkills")),
+        timeout_ms=timeout_ms,
         ignored=ignored_fields(fm),
     )
 
@@ -324,6 +347,10 @@ def validate_agent_text(text: str, fallback_name: Optional[str] = None) -> Dict[
     mode = (fm.get("systemPromptMode") or "").strip()
     if mode and mode.lower() not in ("replace", "append"):
         errors.append(f"systemPromptMode {mode!r} must be 'replace' or 'append'")
+    try:
+        parse_timeout_ms(fm.get("timeoutMs"))
+    except ValueError as exc:
+        errors.append(str(exc))
     for key in ("inheritProjectContext", "inheritSkills"):
         raw = (fm.get(key) or "").strip()
         if raw and parse_bool(raw) is None:
