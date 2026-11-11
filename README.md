@@ -294,8 +294,8 @@ PIER_ORCHESTRATOR=enforce claude   # deny search, checks, git/gh and web calls
   should be delegated is denied with the pier command to use instead. Calls made
   inside a Claude subagent always pass: the Agent tool stays as the fallback.
 - Every classified call appends one line to
-  `${CLAUDE_PLUGIN_DATA}/orchestrator-events.jsonl`: tool, category, verdict and the
-  first two words, never the full command.
+  `${CLAUDE_PLUGIN_DATA}/orchestrator-events.jsonl` (mode 0600): tool, category, verdict
+  and the command name (plus its subcommand, e.g. `git push`), never its arguments.
 
 ## Development
 
