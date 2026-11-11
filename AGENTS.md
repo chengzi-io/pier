@@ -6,12 +6,15 @@ byte pier prints costs its tokens.
 
 ## Layout
 
-- `SKILL.md`: what the host agent reads. `README.md`: for humans.
-  `references/agent-authoring.md`: frontmatter reference, read only when writing agents.
-- `scripts/pier`: CLI entry (argparse, commands). `pier_agents.py`: frontmatter, lookup,
-  validate. `pi_runtime.py`: RunSpec -> Pi flags, running Pi, output budget.
+- `skills/pier/` is the skill (and the plugin's only skill): `SKILL.md` is what the host
+  agent reads, `references/agent-authoring.md` is the frontmatter reference (read only
+  when writing agents). `README.md` is for humans.
+- `skills/pier/scripts/pier`: CLI entry (argparse, commands). `pier_agents.py`: frontmatter,
+  lookup, validate. `pi_runtime.py`: RunSpec -> Pi flags, running Pi, output budget.
   `pi_state.py`: `$PIER_HOME`, sidecars, locks, worktrees. `toon.py`: TOON encoder.
-- `agents/`: bundled examples. `mock/mock_pi`: fake Pi for tests.
+- `skills/pier/agents/`: bundled examples. `mock/mock_pi`: fake Pi for tests.
+- `.claude-plugin/`: `plugin.json` + `marketplace.json`, so the repo installs as a Claude
+  Code plugin from its own marketplace.
 
 ## Invariants
 
@@ -31,8 +34,8 @@ byte pier prints costs its tokens.
 
 ## Changing things
 
-- A CLI or frontmatter change updates `SKILL.md`, `README.md`,
-  `references/agent-authoring.md` and tests in the same change.
+- A CLI or frontmatter change updates `skills/pier/SKILL.md`, `README.md`,
+  `skills/pier/references/agent-authoring.md` and tests in the same change.
 - SKILL.md is loaded on every use: add a line only if it changes what the caller
   types or prevents a retry.
 - Test: `python3 -m unittest discover -s tests` (mock Pi, no model calls);

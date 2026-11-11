@@ -39,7 +39,7 @@ class SlotWaitTimedOut(RunTimedOut):
 
 
 def skill_root() -> Path:
-    """The skill root (this repository): scripts/pi_state.py -> repo root."""
+    """The skill directory: skills/pier/scripts/pi_state.py -> skills/pier."""
     return Path(__file__).resolve().parent.parent
 
 

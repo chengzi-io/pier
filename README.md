@@ -35,15 +35,24 @@ another Pi version.
 
 ## Installation
 
-As a skill:
+As a Claude Code plugin (this repository is its own marketplace):
+
+```bash
+claude plugin marketplace add chengzi-io/pier
+claude plugin install pier@pier
+```
+
+The plugin's only skill is `pier`, read from `skills/pier/SKILL.md`.
+
+The skills CLI reads the same file, so it works too:
 
 ```bash
 npx skills add chengzi-io/pier -y --skill pier
 ```
 
-Or clone the repository and call `scripts/pier` directly. There is no install step. The
-repository root is the skill: `SKILL.md`, `agents/`, `references/` and `scripts/` sit
-side by side.
+Or clone the repository and call `skills/pier/scripts/pier` directly. There is no install
+step. The skill is the `skills/pier/` directory: `SKILL.md`, `agents/`, `references/`
+and `scripts/` sit side by side in it.
 
 In Claude Code, `SKILL.md` puts the agent list into the skill when it loads and
 pre-approves `scripts/pier` through `allowed-tools`, so the agent can pick a role without
@@ -69,15 +78,15 @@ You answer questions about this codebase. Cite path:line. Never edit files.
 Use it (your agent does the same):
 
 ```bash
-./scripts/pier agents list
-./scripts/pier run scout "where is the session lock taken and released?"
+./skills/pier/scripts/pier agents list
+./skills/pier/scripts/pier run scout "where is the session lock taken and released?"
 # stderr: pier: f3b2a1c0 started (scout)
 # stdout: the answer
 # stderr: pier: f3b2a1c0 ok (scout)
 
-./scripts/pier send f3b2a1c0 "and who reclaims a stale one?"
-./scripts/pier run scout "same question" --model anthropic/claude-sonnet-4-5:high
-./scripts/pier ps
+./skills/pier/scripts/pier send f3b2a1c0 "and who reclaims a stale one?"
+./skills/pier/scripts/pier run scout "same question" --model anthropic/claude-sonnet-4-5:high
+./skills/pier/scripts/pier ps
 ```
 
 ## Usage
@@ -154,12 +163,12 @@ You review the change the task names (a diff, commit range or files). ...
 ```
 
 The body is appended to Pi's system prompt (`systemPromptMode: append`) or replaces it
-(the default). [Writing agent files](references/agent-authoring.md)
-covers every field; examples live in [`agents/`](agents/).
+(the default). [Writing agent files](skills/pier/references/agent-authoring.md)
+covers every field; examples live in [`skills/pier/agents/`](skills/pier/agents/).
 
 Lookup order, lowest to highest priority (a later directory wins on the same name):
 
-1. `<skill>/agents`: bundled examples
+1. `<skill>/agents` (`skills/pier/agents`): bundled examples
 2. `$PIER_HOME/agents`: your agents
 3. `<cwd>/.pier/agents`: project agents
 

@@ -21,10 +21,11 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PIER = ROOT / "scripts" / "pier"
+SKILL = ROOT / "skills" / "pier"
+PIER = SKILL / "scripts" / "pier"
 MOCK = ROOT / "mock" / "mock_pi"
 
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(SKILL / "scripts"))
 import pier_agents  # noqa: E402
 import pi_runtime  # noqa: E402
 import pi_state  # noqa: E402
@@ -258,7 +259,7 @@ class DiscoveryTests(Base):
 
     def test_show_prints_path_and_file(self):
         r = self.pier("agents", "show", "reviewer")
-        self.assertEqual(r.stdout.splitlines()[0], str(ROOT / "agents" / "reviewer.md"))
+        self.assertEqual(r.stdout.splitlines()[0], str(SKILL / "agents" / "reviewer.md"))
         self.assertIn("You review the change specified by the task", r.stdout)
 
 
@@ -1539,7 +1540,7 @@ class RealPiArgvTests(Base):
         self.assertEqual(r.returncode, 1)
 
     def test_real_pi_accepts_bundled_agents(self):
-        for f in sorted((ROOT / "agents").glob("*.md")):
+        for f in sorted((SKILL / "agents").glob("*.md")):
             with self.subTest(agent=f.stem):
                 r = self.real_run(f.stem, "t", "--model", "anthropic/claude-sonnet-4-5")
                 self.assertIn("No API key", r.stderr)

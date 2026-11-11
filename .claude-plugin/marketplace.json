@@ -1,0 +1,14 @@
+{
+  "name": "pier",
+  "description": "Delegate tasks to Pi coding-agent sessions on any model, from reusable agent Markdown files.",
+  "owner": {
+    "name": "JoJoJotarou"
+  },
+  "plugins": [
+    {
+      "name": "pier",
+      "source": "./",
+      "description": "Delegate a task to a Pi coding-agent session on any model, from reusable agent Markdown files (role, tools, model); `send` continues a session."
+    }
+  ]
+}
