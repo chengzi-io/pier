@@ -20,11 +20,22 @@ PROMPT = ROOT / "hooks" / "orchestrator-prompt.md"
 ALLOW_BASH = [
     "scripts/pier run librarian \"where is the CLI\"",
     "/Users/me/repo/scripts/pier send abc123 hello",
+    # A pier brief is allowed as a whole, whatever it contains.
+    "scripts/pier run chore \"pytest -q; rg foo | head -1\"",
+    "/Users/me/repo/scripts/pier run chore <<'EOF'\npytest -q\nrg foo | wc -l\ngit push\nEOF",
+    "cd /repo && /repo/scripts/pier run chore \"git status; rg foo\"",
+    "FOO=1 '/Users/me/my repo/scripts/pier' send abc123 \"line one\nline; two\"",
     "git status",
     "git log --oneline -5",
     "git show HEAD",
     "git diff",
     "git branch -a",
+    "git -C /repo status",
+    "git -c core.pager=cat diff",
+    "git --no-pager log -1",
+    "git --git-dir=/repo/.git status",
+    "git --git-dir /repo/.git branch",
+    "git --work-tree /repo status",
     "ls -la",
     "pwd",
     "cat scripts/pier",
@@ -38,6 +49,22 @@ ALLOW_BASH = [
     "cd x && ls -la",
     "FOO=1 ls",
     "cd /tmp",
+    # Wrappers are stripped before classifying.
+    "env FOO=1 ls -la",
+    "env -u PIER_HOME ls -la",
+    "timeout 30 git status",
+    "timeout -s KILL 30 git status",
+    "timeout -k 5 -s KILL 30 ls",
+    "nice -n 5 ls -la",
+    "nohup ls -la",
+    "sudo -E ls -la",
+    "time ls -la",
+    "exec ls -la",
+    "xargs -n 1 ls",
+    "bash -c 'ls -la'",
+    "sh -lc 'git status'",
+    "echo $(ls)",
+    "echo $(git status)",
 ]
 
 DENY_BASH = [
@@ -67,6 +94,33 @@ DENY_BASH = [
     ("git status; go test ./...", "checks"),
     ("FOO=1 pytest", "checks"),
     ("git status && curl https://example.com", "web"),
+    # git global options are skipped before the subcommand.
+    ("git -C /repo push", "vcs"),
+    ("git -c core.pager=cat push", "vcs"),
+    ("git --no-pager commit -m x", "vcs"),
+    ("git --git-dir=/repo/.git push", "vcs"),
+    ("git --work-tree /repo push", "vcs"),
+    ("cd /repo && git -C /repo push", "vcs"),
+    # Wrappers do not hide the call they wrap.
+    ("env FOO=1 rg foo", "search"),
+    ("env -u HOME pytest -q", "checks"),
+    ("timeout 30 rg foo", "search"),
+    ("timeout -s KILL 30 pytest -q", "checks"),
+    ("nice -n 5 cargo build", "checks"),
+    ("nohup go test ./...", "checks"),
+    ("sudo -E git push", "vcs"),
+    ("time npm test", "checks"),
+    ("command rg foo", "search"),
+    ("exec curl https://example.com", "web"),
+    ("xargs -n 1 rg foo", "search"),
+    # Shell strings and command substitutions are classified recursively.
+    ("bash -c 'rg foo'", "search"),
+    ("bash -lc 'git push'", "vcs"),
+    ("sh -ec 'pytest -q'", "checks"),
+    ("zsh -c 'curl https://example.com'", "web"),
+    ("echo $(rg foo)", "search"),
+    ("echo `curl https://example.com`", "web"),
+    ("git status $(rg foo)", "search"),
 ]
 
 
@@ -94,6 +148,10 @@ class Base(unittest.TestCase):
         env = dict(self.env)
         if mode is not None:
             env["PIER_ORCHESTRATOR"] = mode
+        if isinstance(stdin, bytes):
+            return subprocess.run([sys.executable, str(hook or HOOK)] + argv,
+                                  input=stdin, capture_output=True,
+                                  env=env, timeout=60)
         if not isinstance(stdin, str):
             stdin = json.dumps(stdin)
         return subprocess.run([sys.executable, str(hook or HOOK)] + argv,
@@ -148,11 +206,25 @@ class BashTest(Base):
                 self.assertEqual(event["session_id"], "s-1")
                 self.assertTrue(event["ts"].endswith("Z"))
 
-    def test_head_is_two_words_of_offending_segment(self):
+    def test_head_is_command_and_subcommand(self):
         proc = self.run_hook(["pre-tool-use"],
                              self.payload("Bash", {"command": "git status; go test ./..."}))
         self.assert_deny(proc, "checks")
         self.assertEqual(self.events()[0]["head"], "go test")
+
+    def test_head_is_command_and_subcommand_after_wrappers(self):
+        for command, category, head in (
+                ("timeout 30 git -C /repo push", "vcs", "git push"),
+                ("bash -c 'npm run build'", "checks", "npm run"),
+                ("nice -n 5 python3 -m unittest", "checks", "python3 -m unittest"),
+                ("nohup rg foo", "search", "rg"),
+        ):
+            with self.subTest(command=command):
+                self.data.joinpath("orchestrator-events.jsonl").unlink(missing_ok=True)
+                proc = self.run_hook(["pre-tool-use"],
+                                     self.payload("Bash", {"command": command}))
+                self.assert_deny(proc, category)
+                self.assertEqual(self.events()[0]["head"], head)
 
 
 class ToolTest(Base):
@@ -188,6 +260,16 @@ class ToolTest(Base):
                 self.assertEqual(event["category"], "subagent")
                 self.assertEqual(event["verdict"], "allow")
 
+    def test_agent_id_null_or_empty_is_classified_normally(self):
+        for agent_id in (None, ""):
+            with self.subTest(agent_id=agent_id):
+                self.data.joinpath("orchestrator-events.jsonl").unlink(missing_ok=True)
+                data = self.payload("Bash", {"command": "rg foo"})
+                data["agent_id"] = agent_id
+                proc = self.run_hook(["pre-tool-use"], data)
+                self.assert_deny(proc, "search")
+                self.assertEqual(self.events()[0]["category"], "search")
+
 
 class ModeTest(Base):
     def test_inactive_modes_touch_nothing(self):
@@ -219,7 +301,51 @@ class LogTest(Base):
         raw = (self.data / "orchestrator-events.jsonl").read_text(encoding="utf-8")
         self.assertNotIn("TOPSECRET", raw)
         self.assertNotIn(command, raw)
-        self.assertEqual(self.events()[0]["head"], "curl -H")
+        self.assertEqual(self.events()[0]["head"], "curl")
+
+    def test_log_head_never_carries_arguments_or_secrets(self):
+        for command, category, head in (
+                ("curl --header='Authorization: Bearer TOPSECRET' "
+                 "'https://example.com/v1?api_key=TOPSECRET'", "web", "curl"),
+                ("git commit -m 'token=TOPSECRET'", "vcs", "git commit"),
+                ("python3 -m pytest -k 'TOPSECRET' tests", "checks",
+                 "python3 -m pytest"),
+                ("timeout 30 rg -e 'TOPSECRET' .", "search", "rg"),
+        ):
+            with self.subTest(command=command):
+                self.data.joinpath("orchestrator-events.jsonl").unlink(missing_ok=True)
+                proc = self.run_hook(["pre-tool-use"],
+                                     self.payload("Bash", {"command": command}))
+                self.assert_deny(proc, category)
+                self.assertEqual(self.events()[0]["head"], head)
+                raw = (self.data / "orchestrator-events.jsonl").read_text("utf-8")
+                for secret in ("TOPSECRET", "Bearer", "api_key"):
+                    self.assertNotIn(secret, raw)
+
+    def test_log_file_is_private(self):
+        proc = self.run_hook(["pre-tool-use"], self.payload("Bash", {"command": "pwd"}))
+        self.assert_allow(proc)
+        path = self.data / "orchestrator-events.jsonl"
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_existing_log_file_is_tightened(self):
+        path = self.data / "orchestrator-events.jsonl"
+        path.write_text("", encoding="utf-8")
+        path.chmod(0o644)
+        proc = self.run_hook(["pre-tool-use"], self.payload("Bash", {"command": "pwd"}))
+        self.assert_allow(proc)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_created_log_dir_is_private(self):
+        env = dict(self.env)
+        env["CLAUDE_PLUGIN_DATA"] = str(self.tmp / "fresh" / "data")
+        env["PIER_ORCHESTRATOR"] = "shadow"
+        proc = subprocess.run([sys.executable, str(HOOK), "pre-tool-use"],
+                              input=json.dumps(self.payload("Bash", {"command": "pwd"})),
+                              text=True, capture_output=True, env=env, timeout=60)
+        self.assert_allow(proc)
+        dir_mode = (self.tmp / "fresh" / "data").stat().st_mode & 0o777
+        self.assertEqual(dir_mode, 0o700)
 
     def test_log_falls_back_to_home_without_plugin_data(self):
         env = dict(self.env)
@@ -235,17 +361,28 @@ class LogTest(Base):
 
 
 class FailLoudTest(Base):
-    def test_bad_json_fails_loud(self):
-        proc = self.run_hook(["pre-tool-use"], "{not json")
+    def assert_bad_input(self, proc):
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(proc.stdout, "")
-        self.assertIn("invalid hook input", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        lines = proc.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, proc.stderr)
+        self.assertTrue(lines[0].startswith("orchestrator: bad hook input: "), lines[0])
+
+    def test_bad_json_fails_loud(self):
+        self.assert_bad_input(self.run_hook(["pre-tool-use"], "{not json"))
+
+    def test_bad_utf8_fails_loud(self):
+        proc = self.run_hook(["pre-tool-use"], b"{\xff\xfe}")
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, b"")
+        self.assertNotIn(b"Traceback", proc.stderr)
+        lines = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        self.assertEqual(len(lines), 1, proc.stderr)
+        self.assertTrue(lines[0].startswith("orchestrator: bad hook input: "), lines[0])
 
     def test_non_object_json_fails_loud(self):
-        proc = self.run_hook(["pre-tool-use"], "[]")
-        self.assertEqual(proc.returncode, 1)
-        self.assertEqual(proc.stdout, "")
-        self.assertIn("expected a JSON object", proc.stderr)
+        self.assert_bad_input(self.run_hook(["pre-tool-use"], "[]"))
 
 
 class SessionStartTest(Base):
