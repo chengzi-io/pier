@@ -18,8 +18,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 MODES = ("shadow", "enforce")
 PROMPT_NAME = "orchestrator-prompt.md"
-# Claude Code caps SessionStart additionalContext at 10,000 chars.
-MAX_CONTEXT_CHARS = 10000
 EVENTS_NAME = "orchestrator-events.jsonl"
 
 SEGMENT_SPLIT = re.compile(r"&&|\|\||[;|\n]")
@@ -186,7 +184,7 @@ def session_start() -> int:
         print(f"orchestrator: cannot read prompt {str(prompt)!r}: {exc}", file=sys.stderr)
         return 1
     emit({"hookSpecificOutput": {"hookEventName": "SessionStart",
-                                 "additionalContext": text[:MAX_CONTEXT_CHARS]}})
+                                 "additionalContext": text}})
     return 0
 
 
