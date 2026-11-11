@@ -278,6 +278,25 @@ mode suits a long-lived controller; pier sends one prompt per process. See
 not the system prompt, tools, skills or extensions. `<sid>.pier.json` keeps those flags
 so `send` continues with the same role; its pid lets `pier ps` show running sessions.
 
+## Orchestrator mode (plugin only)
+
+The plugin's hooks turn a Claude Code session into an orchestrator that delegates
+legwork to pier. They do nothing unless `PIER_ORCHESTRATOR` is set:
+
+```bash
+PIER_ORCHESTRATOR=shadow claude    # log what would be delegated, block nothing
+PIER_ORCHESTRATOR=enforce claude   # deny search, checks, git/gh and web calls
+```
+
+- SessionStart adds [`hooks/orchestrator-prompt.md`](hooks/orchestrator-prompt.md)
+  (which pier agent does what, how to brief it) to the session.
+- PreToolUse classifies Bash, Grep, Glob and Read calls. In `enforce`, a call that
+  should be delegated is denied with the pier command to use instead. Calls made
+  inside a Claude subagent always pass: the Agent tool stays as the fallback.
+- Every classified call appends one line to
+  `${CLAUDE_PLUGIN_DATA}/orchestrator-events.jsonl`: tool, category, verdict and the
+  first two words, never the full command.
+
 ## Development
 
 ```bash

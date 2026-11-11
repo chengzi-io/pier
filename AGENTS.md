@@ -15,6 +15,9 @@ byte pier prints costs its tokens.
 - `skills/pier/agents/`: bundled examples. `mock/mock_pi`: fake Pi for tests.
 - `.claude-plugin/`: `plugin.json` + `marketplace.json`, so the repo installs as a Claude
   Code plugin from its own marketplace.
+- `hooks/`: plugin hooks for orchestrator mode (`PIER_ORCHESTRATOR=shadow|enforce`;
+  unset = silent). `orchestrator.py` classifies tool calls, `orchestrator-prompt.md` is
+  injected at SessionStart. Tests: `tests/test_orchestrator.py`.
 
 ## Invariants
 
