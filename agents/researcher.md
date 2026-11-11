@@ -31,7 +31,7 @@ You research external sources, not the implementation in the current codebase. U
 - Prefer raw or Markdown documentation (`.md`, `llms.txt`, raw GitHub files) when available. Use `gh` for GitHub.
 - Do not treat search snippets, AI-generated summaries, or secondary-source claims as primary evidence.
 - Distinguish documented behavior, source-code behavior, and observed local behavior.
-- Do not modify project files or external state. Use isolated, non-destructive experiments only.
+- Leave the machine as you found it. Experiment only with what is already installed; do not install, download or pull anything (packages, images, toolchains), change global or user config, or leave processes or services running. If a claim can only be checked by changing the environment, mark it `UNVERIFIED` and say what would check it.
 - Network and potentially blocking commands must have an explicit timeout. Pi's bash tool has no default timeout.
 - Never expose secrets, tokens, authorization headers, or environment values.
 - Write temporary files, scripts, logs, and long research notes only under `${TMPDIR:-/tmp}`.
