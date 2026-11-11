@@ -13,7 +13,7 @@ from pathlib import Path
 from shutil import which
 from typing import Any, List, Optional, Tuple
 
-from pier_agents import AgentDef, THINKING_SUFFIX_RE, filter_tool_list
+from pier_agents import AgentDef, THINKING_SUFFIX_RE
 from pi_state import (FAILED_STOPS, PierError, Turn, ensure_dir,
                       find_session_file, last_turn, patch_sidecar,
                       process_start, sessions_dir, tail_text, write_private)
@@ -136,9 +136,9 @@ def resolve_spec(spec: RunSpec) -> RunSpec:
         spec.notes.append("ignored frontmatter (not mapped, no effect): " + ", ".join(a.ignored))
     spec.model = spec.model or a.model
     if a.tools is not None:
-        spec.tools = filter_tool_list(a.tools, "tools", spec.notes)
+        spec.tools = a.tools
     if a.exclude_tools:
-        spec.exclude_tools = filter_tool_list(a.exclude_tools, "excludeTools", spec.notes) or None
+        spec.exclude_tools = a.exclude_tools
     # pi-subagents: a ':level' suffix on model wins over `thinking`.
     if a.thinking and not (spec.model and THINKING_SUFFIX_RE.search(spec.model)):
         spec.thinking = a.thinking
@@ -163,11 +163,6 @@ def build_flags(spec: RunSpec) -> List[str]:
         flags += ["--no-tools"]
     elif spec.tools:
         flags += ["--tools", ",".join(spec.tools)]
-    # Pi's --tools keeps every MCP tool unless an entry names one, so an
-    # allowlist without mcp__ entries also turns MCP off: strict, and no MCP
-    # tool specs in the prompt.
-    if spec.tools is not None and not any(t.startswith("mcp__") for t in spec.tools):
-        flags += ["--no-mcp"]
     if spec.exclude_tools:
         flags += ["--exclude-tools", ",".join(spec.exclude_tools)]
     flags += ["--name", spec.agent.name]

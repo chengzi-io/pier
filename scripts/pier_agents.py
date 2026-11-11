@@ -290,26 +290,15 @@ def resolve_agent(name: str, agents: Dict[str, AgentDef]) -> AgentDef:
                     + (", ".join(sorted(agents)) or "(none)"))
 
 
-# pi-subagents runtime tool names; not Pi tools. Dropped from tools lists.
-# MCP tools are real Pi tool names (`mcp__<server>__<tool>`, or a glob such as
-# `mcp__radius__*`), so they pass through untouched.
-EXTENSION_ONLY_TOOLS = frozenset(
-    {"contact_supervisor", "intercom", "bg_wait", "structured_output", "watchdog_diff", "subagent"}
-)
-
-
-def filter_tool_list(items: List[str], field_name: str, notes: List[str]) -> List[str]:
-    kept, dropped = [], []
-    for t in items:
-        if t in EXTENSION_ONLY_TOOLS or t.startswith("mcp:") or "/" in t \
-                or t.endswith((".ts", ".js", ".mjs", ".cjs")):
-            dropped.append(t)
-        else:
-            kept.append(t)
-    if dropped:
-        notes.append(f"{field_name}: ignored entries not native Pi tool names (no effect): "
-                     + ", ".join(dropped))
-    return kept
+# `--tools` takes built-in, extension and custom tool names verbatim and ignores
+# a name that matches nothing, so entries pass through untouched: `mcp__radius__*`
+# is a Pi pattern, `subagent` is a real name while pi-subagents is loaded. Only
+# the shapes a tool name cannot have are worth a warning.
+def odd_tool_names(items: List[str]) -> List[str]:
+    """Entries that are not a Pi tool name: `mcp:` (the prefix is `mcp__`), a path,
+    a source file. `+name`/`-name` are Pi's own modifier syntax, so they pass."""
+    return [t for t in items if t.startswith("mcp:") or "/" in t
+            or t.endswith((".ts", ".js", ".mjs", ".cjs"))]
 
 
 def validate_agent_text(text: str, fallback_name: Optional[str] = None) -> Dict[str, Any]:
@@ -346,5 +335,7 @@ def validate_agent_text(text: str, fallback_name: Optional[str] = None) -> Dict[
         warnings.append("ignored frontmatter (not mapped, no effect): " + ", ".join(ignored))
     for key in ("tools", "excludeTools"):
         if key in fm:
-            filter_tool_list(parse_list(fm[key]) or [], key, warnings)
+            odd = odd_tool_names(parse_list(fm[key]) or [])
+            if odd:
+                warnings.append(f"{key}: not Pi tool names, ignored by Pi: " + ", ".join(odd))
     return {"ok": not errors, "name": name or None, "errors": errors, "warnings": warnings}

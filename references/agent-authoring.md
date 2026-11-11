@@ -33,7 +33,7 @@ Output:
 | `model` | `--model` verbatim | e.g. `anthropic/claude-sonnet-4-5`, `provider/id:low`. `inherit` or empty = omitted |
 | `thinking` | `--thinking` | `off` `minimal` `low` `medium` `high` `xhigh` `max`. A `:level` suffix on `model` wins |
 | `defaultProvider` | `--provider` | Only when `model` has no `provider/` prefix |
-| `tools` | `--tools` CSV | Strict allowlist of Pi tool names. Empty = `--no-tools`. No `mcp__` entry = also `--no-mcp` (Pi keeps every MCP tool otherwise); list MCP tools as `mcp__<server>__<tool>` or `mcp__<server>__*`. Extension-only names are dropped |
+| `tools` | `--tools` CSV | Pi tool names, passed through verbatim: built-in (`read`, `bash`, …), extension (`subagent`), or MCP (`mcp__<server>__<tool>`, `mcp__<server>__*`). A name that matches nothing is ignored by Pi. Empty = `--no-tools` |
 | `excludeTools` | `--exclude-tools` CSV | |
 | `systemPromptMode` | `--system-prompt` / `--append-system-prompt` | `replace` (default) or `append` |
 | `skills` | repeated `--skill <resolved path>` | Names looked up in `.pi/skills`, `.agents/skills`, `~/.pi/agent/skills`, `~/.agents/skills`; anything else (package or settings skills) goes in `skillPath`. Empty list or `inheritSkills: false` = `--no-skills`. An unknown name is an error |
