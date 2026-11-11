@@ -156,7 +156,7 @@ pier never reads pi-subagents directories (`~/.pi/agent/agents`, `.pi/agents`, `
 | `model` | `--model` verbatim; `inherit` or empty = omitted; `pier run --model` overrides it |
 | `thinking` | `--thinking`, unless the model has a `:level` suffix |
 | `defaultProvider` | `--provider`, only when the model has no `provider/` prefix |
-| `tools` | `--tools a,b`, plus `--no-mcp` when no entry starts with `mcp__`; empty = `--no-tools --no-mcp`; extension-only names dropped |
+| `tools` | `--tools a,b` verbatim; empty = `--no-tools` |
 | `excludeTools` | `--exclude-tools a,b` |
 | `systemPromptMode` | `replace` (default) = `--system-prompt`; `append` = `--append-system-prompt` |
 | `skills` | repeated `--skill <resolved path>`; empty or `inheritSkills: false` = `--no-skills` |
@@ -165,8 +165,11 @@ pier never reads pi-subagents directories (`~/.pi/agent/agents`, `.pi/agents`, `
 | `inheritProjectContext: false` | `--no-context-files` |
 | anything else, including `advertise` / `async` | ignored, no effect (`validate` and `--dry-run` list it) |
 
-`tools` is a strict allowlist: Pi's own `--tools` keeps every MCP tool unless an entry
-names one, so pier turns MCP off unless you list MCP tools explicitly.
+`tools` entries reach Pi unchanged. Pi accepts built-in, extension and custom tool
+names and ignores one that matches nothing, so `mcp__<server>__*` narrows MCP tools the
+way Pi's own `--tools` does, and `subagent` works while pi-subagents is loaded. pier
+never adds `--no-mcp`: to keep MCP tools away from the model, write
+`excludeTools: mcp__*`.
 
 pier always adds `--print`, `--session-dir $PIER_HOME/sessions`, then `--session-id <new
 uuid>` (run) or `--session <session file>` (send), an `--append-system-prompt` with the

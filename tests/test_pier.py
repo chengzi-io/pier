@@ -272,7 +272,7 @@ class MappingTests(Base):
         self.assertEqual(flag(a, "--thinking"), "high")
         self.assertEqual(flag(a, "--tools"), "read,bash")
         self.assertEqual(flag(a, "--exclude-tools"), "write")
-        self.assertIn("--no-mcp", a)
+        self.assertNotIn("--no-mcp", a)  # MCP reach stays Pi's own semantics
         self.assertEqual(flag(a, "--name"), "m")
         self.assertEqual(Path(flag(a, "--session-dir")).resolve(), (self.state() / "sessions").resolve())
         self.assertIn("--session-id", a)
@@ -305,11 +305,14 @@ class MappingTests(Base):
         self.assertIn("unrecognized arguments", r.stderr)
         self.assertEqual(self.calls(), [])
 
-    def test_non_native_tools_dropped_with_note(self):
-        self.write_agent(".pier/agents/e.md", "---\nname: e\ntools: contact_supervisor, mcp:x/y\nlauncher: tmux\n---\nB\n")
+    def test_unknown_tool_names_pass_through(self):
+        # Pi ignores a name that matches no registered tool, and `contact_supervisor`
+        # is a real name while pi-subagents is loaded: pier passes both through.
+        self.write_agent(".pier/agents/e.md",
+                         "---\nname: e\ntools: contact_supervisor, mcp:x/y\nlauncher: tmux\n---\nB\n")
         r = self.pier("run", "e", "go", "--dry-run")
-        self.assertIn("--no-tools", shlex.split(r.stdout))
-        self.assertIn("contact_supervisor", r.stderr)
+        argv = shlex.split(r.stdout)
+        self.assertEqual(flag(argv, "--tools"), "contact_supervisor,mcp:x/y")
         self.assertIn("launcher", r.stderr)
         r = self.pier("run", "e", "go")
         lines = r.stderr.splitlines()
@@ -321,16 +324,18 @@ class MappingTests(Base):
                          "---\nname: m\ntools: read, mcp__radius__search, mcp__radius__*\n---\nB\n")
         a = self.dry("run", "m", "go")
         self.assertEqual(flag(a, "--tools"), "read,mcp__radius__search,mcp__radius__*")
-        self.assertNotIn("--no-mcp", a)  # named MCP tools keep MCP on
+        self.assertNotIn("--no-mcp", a)  # pier never narrows MCP; Pi decides
 
-    def test_tools_allowlist_without_mcp_turns_mcp_off(self):
-        # Pi's --tools keeps all MCP tools unless an entry names one.
-        self.assertIn("--no-mcp", self.dry("run", "explorer", "go"))
+    def test_no_mcp_is_never_added(self):
+        # Pi's --tools keeps MCP tools callable from codemode scripts whatever the
+        # list says; turning MCP off is `excludeTools: mcp__*` (tools) or
+        # `--no-mcp` (server connections), never an implicit side effect.
+        self.assertNotIn("--no-mcp", self.dry("run", "explorer", "go"))
         self.write_agent(".pier/agents/t.md", "---\nname: t\ntools:\n---\nB\n")
         a = self.dry("run", "t", "go")
         self.assertIn("--no-tools", a)
-        self.assertIn("--no-mcp", a)
-        self.write_agent(".pier/agents/d.md", "---\nname: d\n---\nB\n")  # no tools key: Pi defaults
+        self.assertNotIn("--no-mcp", a)
+        self.write_agent(".pier/agents/d.md", "---\nname: d\ntools: read, bash\n---\nB\n")
         self.assertNotIn("--no-mcp", self.dry("run", "d", "go"))
 
     def test_prompt_is_task_and_body_is_system_prompt(self):

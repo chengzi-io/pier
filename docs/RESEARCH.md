@@ -18,7 +18,7 @@ credentials, so no model call).
 | `--no-context-files` | `inheritProjectContext: false` (`inheritGlobalContext` ignored) |
 | `--print` | Always. Pi exits non-zero when the final reply has stopReason `error`, `aborted` or `length`; `--mode json` exits 0 then (docs/cli-integration.md). stdout is discarded; the reply is read from the session file |
 | `--model` `--provider` `--thinking` `--tools` `--no-tools` `--exclude-tools` `--name` | Frontmatter; `--model` also from `pier run --model` |
-| `--no-mcp` | `tools:` present without an `mcp__` entry (Pi's `--tools` keeps MCP tools otherwise) |
+| `--no-mcp` | Not mapped: pier never sets it (Pi's `--tools` leaves MCP reach untouched) |
 | `--session-dir` `--session-id` `--session` | New session per run; `send` passes the session file |
 
 ## Out of scope
