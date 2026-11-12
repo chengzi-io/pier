@@ -50,7 +50,8 @@ leads with the result and cites `path:line`: spot-check it, do not redo the work
 - A reply over the budget (24k chars, `PIER_MAX_CHARS`) arrives as a 2k preview + the
   full-text path on stdout's last line: read that file, do not re-run.
 - Runs take minutes: run pier in the background (Claude Code: Bash
-  `run_in_background: true`); you are notified at exit, so do not poll. Independent
+  `run_in_background: true`); you are notified at exit, so do not poll. Read its output
+  file with Read, not `cat`/`tail`: Bash output may be capped. Independent
   tasks = one background `pier run` each, in parallel. If pier is killed, Pi stops too
   and pier exits 128+signal with a `failed` line: `pier send <ref> "continue"`.
 - `--worktree`: a clean worktree is removed at exit; a changed one is kept (path on

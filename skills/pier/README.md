@@ -103,8 +103,10 @@ pier never reads pi-subagents directories (`~/.pi/agent/agents`, `.pi/agents`, `
 ## Long runs
 
 Pi runs often take minutes. If the host can run a command in the background (Claude
-Code: Bash with `run_in_background`), use that instead of a long foreground timeout.
-Independent tasks can run in parallel, one `pier run` each.
+Code: Bash with `run_in_background`), use that instead of a long foreground timeout,
+and read the output file with a file-read tool: hosts may cap shell output (Claude
+Code's `bashOutputMaxChars`), which would cost another call. Independent tasks can run
+in parallel, one `pier run` each.
 
 Pi runs in pier's process group, and pier terminates it — and every process Pi started —
 on `SIGTERM`, `SIGHUP` or `SIGINT`, so a host timeout never leaves Pi running with
