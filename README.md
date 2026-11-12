@@ -32,6 +32,11 @@ claude plugin install pier@pier
 This installs the skill and the reminder. For the skill alone in another agent, see
 [`skills/pier/README.md`](skills/pier/README.md#installation).
 
+The plugin pins no version, so each commit on `main` is a new one. Third-party
+marketplaces don't auto-update by default: turn it on under `/plugin` → Marketplaces, or
+run `claude plugin marketplace update pier && claude plugin update pier@pier`; the new
+version loads in the next session.
+
 ## Set up the orchestrator
 
 Three layers; only the last one ships in the plugin.

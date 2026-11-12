@@ -1,7 +1,6 @@
 {
   "name": "pier",
   "description": "Delegate a task to a Pi coding-agent session on any model, from reusable agent Markdown files (role, tools, model); `send` continues a session.",
-  "version": "0.1.0",
   "author": {
     "name": "JoJoJotarou"
   },
