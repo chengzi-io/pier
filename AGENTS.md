@@ -8,16 +8,18 @@ byte pier prints costs its tokens.
 
 - `skills/pier/` is the skill (and the plugin's only skill): `SKILL.md` is what the host
   agent reads, `references/agent-authoring.md` is the frontmatter reference (read only
-  when writing agents). `README.md` is for humans.
+  when writing agents), `README.md` documents the skill and CLI for humans. The root
+  `README.md` covers the plugin as a whole.
 - `skills/pier/scripts/pier`: CLI entry (argparse, commands). `pier_agents.py`: frontmatter,
   lookup, validate. `pi_runtime.py`: RunSpec -> Pi flags, running Pi, output budget.
   `pi_state.py`: `$PIER_HOME`, sidecars, locks, worktrees. `toon.py`: TOON encoder.
 - `skills/pier/agents/`: bundled examples. `mock/mock_pi`: fake Pi for tests.
 - `.claude-plugin/`: `plugin.json` + `marketplace.json`, so the repo installs as a Claude
   Code plugin from its own marketplace.
-- `hooks/`: plugin hooks for orchestrator mode (`PIER_ORCHESTRATOR=shadow|enforce`;
-  unset = silent). `orchestrator.py` classifies tool calls, `orchestrator-prompt.md` is
-  injected at SessionStart. Tests: `tests/test_orchestrator.py`.
+- `hooks/hooks.json` + `scripts/<event>/<job>.py`: plugin hooks for orchestrator mode,
+  one job per script; today only `scripts/session-start/orchestrator_reminder.py`.
+  Tool limits live in user settings (README, Orchestrator mode). Tests:
+  `tests/test_<job>.py`.
 
 ## Invariants
 
@@ -37,7 +39,7 @@ byte pier prints costs its tokens.
 
 ## Changing things
 
-- A CLI or frontmatter change updates `skills/pier/SKILL.md`, `README.md`,
+- A CLI or frontmatter change updates `skills/pier/SKILL.md`, `skills/pier/README.md`,
   `skills/pier/references/agent-authoring.md` and tests in the same change.
 - SKILL.md is loaded on every use: add a line only if it changes what the caller
   types or prevents a retry.

@@ -2,21 +2,13 @@
   "hooks": {
     "SessionStart": [
       {
+        "matcher": "startup|clear|compact",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/orchestrator.py\" session-start"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash|Grep|Glob|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/orchestrator.py\" pre-tool-use"
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/session-start/orchestrator_reminder.py"],
+            "timeout": 10
           }
         ]
       }
