@@ -20,7 +20,7 @@ from pier_agents import (collect_agents, load_agent_file,
 from pi_runtime import (DEFAULT_TIMEOUT_MS, RunSpec, _on_signal, build_flags,
                         interrupted_outcome, max_chars, pi_argv, prompt_args,
                         queued_timeout_outcome, report, resolve_pi_binary,
-                        resolve_spec, run_turn, summary_line, timeout_outcome)
+                        resolve_spec, run_turn, timeout_outcome)
 from pi_state import (FAILED_STOPS, PierError, RunTimedOut, SlotWaitTimedOut,
                       check_run_limits,
                       cleanup_worktree,
@@ -123,8 +123,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # the summary.
         if wt:
             cleanup_worktree(home, sid, ref, wt)
-    print(summary_line(ref, out, spec.agent.name), file=sys.stderr)
-    return report(out, home, sid, budget)
+    return report(ref, out, spec.agent.name, home, sid, budget)
 
 
 def print_dry_run(cwd: Path, notes: List[str], home: Path, flags: List[str],
@@ -182,8 +181,7 @@ def cmd_send(args: argparse.Namespace) -> int:
                 out = timeout_outcome(ref, timeout_ms)
     except SystemExit as exc:
         out = interrupted_outcome(exc.code if isinstance(exc.code, int) else 1)
-    print(summary_line(ref, out, side.get("agent")), file=sys.stderr)
-    return report(out, home, sid, budget)
+    return report(ref, out, side.get("agent"), home, sid, budget)
 
 
 def session_row(home: Path, sid: str, data: Dict[str, Any], mtime: float) -> Dict[str, Any]:

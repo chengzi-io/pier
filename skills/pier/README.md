@@ -169,8 +169,9 @@ file passed as `@path`.
 | Session busy (turn running, or another `send` holds it) | — | `pier: error: session <ref> is running / is already in use …` | 2 |
 | Invalid arguments, unknown agent or session, Pi not found | — | `pier: error: …` | 2 |
 
-The started line is printed before Pi starts, so the ref survives a killed run. An
-unknown ref errors with the five most recent sessions. `--dry-run` prints
+The started line is printed before Pi starts, so the ref survives a killed run.
+With stdout and stderr on one file, the reply comes before the summary line.
+An unknown ref errors with the five most recent sessions. `--dry-run` prints
 `cd <cwd> && pi …`; values over 400 chars are clipped and shown with their length. With
 `--worktree` the `cd` target is the placeholder `$PIER_HOME/worktrees/<ref>`, and a note
 names the project it would snapshot.

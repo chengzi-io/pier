@@ -456,9 +456,12 @@ def max_chars() -> int:
     return n
 
 
-def report(out: Outcome, home: Path, sid: str, budget: int) -> int:
+def report(ref: str, out: Outcome, name: Optional[str], home: Path, sid: str,
+           budget: int) -> int:
     """Print the reply within the output budget; an over-budget reply is spilled
-    to $PIER_HOME/out/<sid>.md and stdout ends with its path."""
+    to $PIER_HOME/out/<sid>.md and stdout ends with its path. Then the summary, then
+    the error: a host that points stdout and stderr at one file (Claude Code does)
+    shows them in this order, and the error stays the last line."""
     if out.reply and len(out.reply) > budget:
         path = spill_path(home, sid)
         ensure_dir(path.parent)
@@ -474,6 +477,8 @@ def report(out: Outcome, home: Path, sid: str, budget: int) -> int:
             print(f"full reply: {path}")
     elif out.reply:
         print(out.reply)
+    sys.stdout.flush()  # before the stderr lines: one merged file shows this order
+    print(summary_line(ref, out, name), file=sys.stderr)
     if out.error is None:
         return 0
     print(f"pier: error: {out.error}", file=sys.stderr)

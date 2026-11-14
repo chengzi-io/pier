@@ -78,6 +78,15 @@ class Base(unittest.TestCase):
         self.assertEqual(tokens[2], "&&")
         return tokens[3:]
 
+    def pier_merged(self, *args, env=None, cwd=None):
+        """Run pier with stdout and stderr on one file, as Claude Code does."""
+        log = self.tmp / "merged.log"
+        with open(log, "w", encoding="utf-8") as fh:
+            r = subprocess.run([sys.executable, str(PIER), *args], cwd=str(cwd or self.proj),
+                               env=self.full_env(env), stdin=subprocess.DEVNULL,
+                               stdout=fh, stderr=subprocess.STDOUT, text=True, timeout=60)
+        return r.returncode, log.read_text(encoding="utf-8")
+
     def argv(self):
         return json.loads(self.rec.read_text())
 
@@ -571,6 +580,40 @@ class SessionTests(Base):
         self.assertTrue(line.startswith(f"pier: {ref} failed (reviewer)"), r.stderr)
         self.assertNotIn(" — ", line)  # the reason is reported once, below
         self.assertEqual(r.stderr.count("pier: error:"), 1, r.stderr)
+
+    def test_one_file_output_keeps_the_reply_before_the_summary(self):
+        # Claude Code points stdout and stderr at one file: the reply must come
+        # before the summary, and the error stays the very last line.
+        code, log = self.pier_merged("run", "reviewer", "hello")
+        self.assertEqual(code, 0, log)
+        ref = log.splitlines()[0].split()[1]
+        self.assertEqual(log.splitlines(), [f"pier: {ref} started (reviewer)",
+                                            "mock-ok: hello",
+                                            f"pier: {ref} ok (reviewer)"])
+        code, log = self.pier_merged("run", "reviewer", "x",
+                                     env={"MOCK_PI_STOP": "length", "MOCK_PI_REPLY": "PARTIAL"})
+        self.assertEqual(code, 1, log)
+        lines = log.splitlines()
+        ref = lines[0].split()[1]
+        self.assertEqual(lines[:3], [f"pier: {ref} started (reviewer)", "PARTIAL",
+                                     f"pier: {ref} failed (reviewer)"])
+        self.assertEqual(len(lines), 4, log)  # the error is the last line
+        self.assertTrue(lines[3].startswith("pier: error: "), log)
+        sid = self.sid_of(self.pier("run", "reviewer", "first"))
+        code, log = self.pier_merged("send", sid, "follow")
+        self.assertEqual(code, 0, log)
+        # send announces itself too: a background send is not blank until it ends
+        self.assertEqual(log.splitlines(), [f"pier: {sid[:8]} started (reviewer)",
+                                            f"mock-ok: follow [resumed {sid}]",
+                                            f"pier: {sid[:8]} ok (reviewer)"])
+        code, log = self.pier_merged("send", sid, "again",
+                                     env={"MOCK_PI_STOP": "length", "MOCK_PI_REPLY": "PART"})
+        self.assertEqual(code, 1, log)
+        lines = log.splitlines()
+        self.assertEqual(lines[:3], [f"pier: {sid[:8]} started (reviewer)",
+                                     f"PART [resumed {sid}]", f"pier: {sid[:8]} failed (reviewer)"])
+        self.assertEqual(len(lines), 4, log)  # the error is the last line
+        self.assertTrue(lines[3].startswith("pier: error: "), log)
 
     def test_send_resolves_prefix_and_errors_on_ambiguity(self):
         sid = self.sid_of(self.pier("run", "reviewer", "first"))
