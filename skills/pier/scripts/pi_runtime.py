@@ -354,7 +354,7 @@ class Outcome:
     code: int
 
 
-def turn_outcome(turn: Optional[Turn], code: int, err: str) -> Outcome:
+def turn_outcome(turn: Optional[Turn], code: int, err: str, ref: str) -> Outcome:
     """Judge a turn from the session file first: a provider error or abort is a
     failure even when Pi exits 0, and earlier text in the turn is not the reply."""
     exit_code = code if 0 < code < 256 else 1
@@ -367,7 +367,7 @@ def turn_outcome(turn: Optional[Turn], code: int, err: str) -> Outcome:
                        exit_code)
     if turn and turn.stop == "length":
         return Outcome(turn.reply, "reply cut off at the model's output token limit"
-                       " (continue it: pier send <ref> \"continue\")", exit_code)
+                       f' (continue it: pier send {ref} "continue")', exit_code)
     if code != 0:
         return Outcome("", f"pi exited {code}: {tail_text(err) or '(no stderr)'}", exit_code)
     if not turn or not turn.reply:
@@ -399,7 +399,7 @@ def run_turn(home: Path, binary: str, sid: str, cwd: Path, flags: List[str],
             patch_sidecar(home, sid, pid=None, pid_start=None)
     sfile = find_session_file(home, sid)
     turn = last_turn(sfile) if sfile else Turn("", None, "")
-    return turn_outcome(turn, code, err), turn
+    return turn_outcome(turn, code, err, ref), turn
 
 
 def fmt_duration(ms: int) -> str:

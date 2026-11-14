@@ -212,7 +212,7 @@ class LastTurnTests(unittest.TestCase):
     def test_failed_stop_reason_beats_exit_zero_and_earlier_text(self):
         # JSON-mode Pi exits 0 on provider errors; the session entry is authoritative.
         t = pi_state.Turn("let me look", "error", "529 overloaded")
-        out = pi_runtime.turn_outcome(t, 0, "")
+        out = pi_runtime.turn_outcome(t, 0, "", "deadbeef")
         self.assertEqual(out.reply, "")
         self.assertIn("529 overloaded", out.error)
         self.assertEqual(out.code, 1)
@@ -477,6 +477,8 @@ class SessionTests(Base):
         self.assertEqual(r.returncode, 1)
         self.assertEqual(r.stdout, "PARTIAL\n")
         self.assertIn("output token limit", r.stderr)
+        # a hint the caller can paste: a literal `<ref>` is a shell redirect
+        self.assertIn(f'pier send {self.ref_of(r)} "continue"', r.stderr)
         self.assertIn(",failed,", self.pier("ps").stdout)  # a cut reply is not ok
 
     def test_over_budget_reply_spills_to_file(self):
