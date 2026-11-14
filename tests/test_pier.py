@@ -577,6 +577,7 @@ class SessionTests(Base):
         r = self.pier("send", sid[:12], "via prefix", cwd=self.tmp)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("[resumed", r.stdout)
+        self.assertEqual(r.stderr.splitlines()[0], f"pier: {sid[:8]} started (reviewer)")
         r = self.pier("send", "reviewer", "x")  # an agent name is not a session handle
         self.assertEqual(r.returncode, 2)
         self.assertIn("unknown session", r.stderr)

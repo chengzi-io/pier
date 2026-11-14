@@ -171,6 +171,8 @@ def cmd_send(args: argparse.Namespace) -> int:
     try:
         with session_lock(home, sid):
             ensure_not_running(ref, load_sidecar(home, sid))  # a run may have started since
+            print(f"pier: {ref} started ({side.get('agent') or '?'})", file=sys.stderr,
+                  flush=True)
             try:
                 out, _ = run_turn(home, binary, sid, cwd, side["flags"],
                                   ["--session", str(sfile)], task, ref, deadline)
