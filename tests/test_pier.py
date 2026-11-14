@@ -6,7 +6,9 @@ Pi binary with an empty HOME (no credentials -> no model call).
 """
 from __future__ import annotations
 
+import contextlib
 import errno
+import io
 import json
 import os
 import shlex
@@ -225,6 +227,97 @@ class LastTurnTests(unittest.TestCase):
         self.assertEqual(out.reply, "")
         self.assertIn("529 overloaded", out.error)
         self.assertEqual(out.code, 1)
+
+    def test_tool_calls_are_counted_and_reset_at_a_new_user_message(self):
+        def call(name):
+            return {"role": "assistant",
+                    "content": [{"type": "toolCall", "name": name,
+                                 "arguments": {"path": "/etc/shadow"}}]}
+        p = self.session({"role": "user", "content": "q"}, call("grep"), call("read"),
+                         {"role": "toolResult", "content": [{"type": "text", "text": "x"}]})
+        t = pi_state.last_turn(p)
+        self.assertEqual((t.tool_calls, t.last_tool), (2, "read"))
+        p = self.session({"role": "user", "content": "q1"}, call("grep"),
+                         {"role": "user", "content": "q2"}, call("edit"))
+        t = pi_state.last_turn(p)
+        self.assertEqual((t.tool_calls, t.last_tool), (1, "edit"))
+
+
+class HeartbeatTests(Base):
+    """The progress line: in-process, because pier has no flag or env var for a
+    short interval and the line must still carry the real ref."""
+
+    def session_file(self, sid, *messages):
+        sdir = self.state() / "sessions"
+        sdir.mkdir(parents=True, exist_ok=True)
+        p = sdir / f"2026-01-01T00-00-00_{sid}.jsonl"
+        lines = [json.dumps({"type": "session", "id": sid})]
+        lines += [json.dumps({"type": "message", "message": m}) for m in messages]
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return p
+
+    def test_progress_line_names_tools_and_tokens(self):
+        def call(name):
+            return {"role": "assistant",
+                    "content": [{"type": "toolCall", "name": name,
+                                 "arguments": {"path": "/etc/shadow"}}]}
+        sid = "c0ffee00-0000-0000-0000-000000000000"
+        now = time.monotonic()
+        self.session_file(sid, {"role": "user", "content": "q"}, call("grep"), call("read"),
+                          {"role": "assistant", "content": [{"type": "text", "text": "x"}],
+                           "usage": {"input": 1500, "output": 301, "totalTokens": 1801}})
+        line = pi_runtime.progress_line(self.state(), sid, sid[:8], now - 370, now + 850)
+        self.assertEqual(line, f"pier: {sid[:8]} running 6m · 2 tools, last read · 1.8k tok"
+                               " · 14m left")
+        self.assertNotIn("/etc/shadow", line)  # tool arguments never reach stderr
+
+    def test_progress_line_without_a_session_file_has_no_tools_or_tokens(self):
+        sid = "00000000-0000-0000-0000-000000000000"
+        now = time.monotonic()
+        line = pi_runtime.progress_line(self.state(), sid, sid[:8], now - 5, now + 60)
+        self.assertEqual(line, f"pier: {sid[:8]} running 5s · 59s left")
+
+    def test_progress_line_read_error_is_reported_not_raised(self):
+        def boom(_path):  # a malformed line, not only an I/O error
+            raise AttributeError("'list' object has no attribute 'get'")
+        sid = "deadbeef-0000-0000-0000-000000000000"
+        self.session_file(sid, {"role": "user", "content": "q"})
+        real, pi_runtime.last_turn = pi_runtime.last_turn, boom
+        try:
+            line = pi_runtime.progress_line(self.state(), sid, sid[:8], time.monotonic(),
+                                            time.monotonic() + 60)
+        finally:
+            pi_runtime.last_turn = real
+        self.assertTrue(line.startswith(f"pier: cannot read {sid[:8]} progress: "), line)
+
+    def test_run_pi_prints_a_progress_line_while_pi_runs(self):
+        sid = "abcdef00-1111-2222-3333-444455556666"
+        ref = sid[:8]
+        argv = [str(MOCK), "--print", "--session-dir", str(self.state() / "sessions"),
+                "--session-id", sid, "--", "work"]
+        deadline = time.monotonic() + 60
+        started = time.monotonic()
+        buf = io.StringIO()
+        prev_sleep = os.environ.get("MOCK_PI_SLEEP")
+        prev_step = pi_runtime.HEARTBEAT_SECONDS
+        os.environ["MOCK_PI_SLEEP"], pi_runtime.HEARTBEAT_SECONDS = "1.3", 0.4
+        try:
+            with contextlib.redirect_stderr(buf):
+                code, err = pi_runtime.run_pi(
+                    self.proj, argv, deadline,
+                    heartbeat=lambda: pi_runtime.progress_line(self.state(), sid, ref,
+                                                               started, deadline))
+        finally:
+            pi_runtime.HEARTBEAT_SECONDS = prev_step
+            if prev_sleep is None:
+                os.environ.pop("MOCK_PI_SLEEP", None)
+            else:
+                os.environ["MOCK_PI_SLEEP"] = prev_sleep
+        self.assertEqual(code, 0, err)
+        lines = buf.getvalue().splitlines()
+        self.assertGreaterEqual(len(lines), 2, lines)
+        for line in lines:
+            self.assertRegex(line, rf"^pier: {ref} running \d+s · \d+s left$")
 
 
 class DiscoveryTests(Base):

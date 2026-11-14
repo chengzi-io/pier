@@ -54,6 +54,7 @@ Use it (your agent does the same):
 pier agents list
 pier run scout "where is the session lock taken and released?"
 # stderr: pier: f3b2a1c0 started (scout)
+# stderr: pier: f3b2a1c0 running 2m · 3 tools, last read · 14k tok · 18m left
 # stdout: the answer
 # stderr: pier: f3b2a1c0 ok (scout)
 
@@ -61,6 +62,9 @@ pier send f3b2a1c0 "and who reclaims a stale one?"
 pier run scout "same question" --model anthropic/claude-sonnet-4-5:high
 pier ps
 ```
+
+While Pi runs, pier prints a progress line like the second one every 2 minutes, so a
+long run never looks dead; it is informational only.
 
 ## Usage
 
@@ -158,7 +162,7 @@ file passed as `@path`.
 
 | Situation | stdout | stderr | Exit |
 |---|---|---|---|
-| Success | reply | `pier: <ref> started (agent)` … `pier: <ref> ok (agent)` | 0 |
+| Success | reply | `pier: <ref> started (agent)` … `pier: <ref> running …` … `pier: <ref> ok (agent)` | 0 |
 | Model error or abort | — | `pier: error: model run error: …` | Pi's code, else 1 |
 | Reply cut off at the token limit | partial reply | `pier: error: … (continue it: pier send <ref> "continue")` | Pi's code, else 1 |
 | Turn ended on a tool call with no answer (Pi exited mid-turn) | — | `pier: error: turn ended at a tool call …` | Pi's code, else 1 |
@@ -170,7 +174,9 @@ file passed as `@path`.
 | Invalid arguments, unknown agent or session, Pi not found | — | `pier: error: …` | 2 |
 
 The started line is printed before Pi starts, so the ref survives a killed run.
-With stdout and stderr on one file, the reply comes before the summary line.
+While Pi runs, stderr carries a progress line every 2 minutes
+(`pier: <ref> running <elapsed> · <n> tools, last <name> · <tok> tok · <left> left`);
+with stdout and stderr on one file, the reply comes before the summary line.
 An unknown ref errors with the five most recent sessions. `--dry-run` prints
 `cd <cwd> && pi …`; values over 400 chars are clipped and shown with their length. With
 `--worktree` the `cd` target is the placeholder `$PIER_HOME/worktrees/<ref>`, and a note

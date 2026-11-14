@@ -366,6 +366,8 @@ class Turn:
     stop: Optional[str]  # stopReason of the last assistant message
     error: str  # its errorMessage
     usage: Optional[Dict[str, Any]] = None  # summed over the turn's assistant messages
+    tool_calls: int = 0  # toolCall parts since the last user message
+    last_tool: str = ""  # name of the most recent one; never its arguments
 
 
 # Pi writes one non-cumulative usage block per assistant message (one per model
@@ -406,6 +408,10 @@ def last_turn(session_file: Path) -> Turn:
                 if turn.usage is None:
                     turn.usage = {}
                 add_usage(turn.usage, u)
+            for part in msg.get("content") or []:
+                if isinstance(part, dict) and part.get("type") == "toolCall":
+                    turn.tool_calls += 1
+                    turn.last_tool = part.get("name") or ""
             text = _message_text(msg).strip()
             if text:
                 turn.reply = text

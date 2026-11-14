@@ -39,7 +39,8 @@ the reply must contain into the task; a vague brief costs extra `send` rounds. T
 leads with the result and cites `path:line`: spot-check it, do not redo the work.
 
 - stdout = the reply only. stderr starts with `pier: <ref> started (<agent>)`: keep the
-  8-char `<ref>` for `send`/`ps`. After the run: `pier: <ref> ok|failed`.
+  8-char `<ref>` for `send`/`ps`. After the run: `pier: <ref> ok|failed`. Lines
+  `pier: <ref> running …` (every 2 min) are progress; no action needed.
 - Failure = non-zero exit and a final `pier: error: …` line. A reply cut at the model's
   token limit is printed and exits non-zero: `pier send <ref> "continue"`.
 - A run that hits its deadline (20 min default) exits 124 with no reply: the session

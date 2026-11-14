@@ -24,6 +24,7 @@ byte pier prints costs its tokens.
 ## Invariants
 
 - stdout = the reply only. stderr: `pier: <ref> started (<agent>)` first, then
+  `pier: <ref> running …` progress lines while Pi runs (every 2 min), then
   `pier: <ref> ok|failed (<agent>)`; a failure adds a final `pier: error: …` and a
   non-zero exit (124 when the run deadline passed).
 - Behaviour lives in the agent file; the CLI adds only `--agent-file`, `--model`,

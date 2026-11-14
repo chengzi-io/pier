@@ -12,11 +12,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from shutil import which
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pier_agents import AgentDef, THINKING_SUFFIX_RE
 from pi_state import (FAILED_STOPS, PierError, RunTimedOut, Turn, ensure_dir,
-                      find_session_file, last_turn, patch_sidecar,
+                      find_session_file, fmt_age, fmt_tokens, last_turn, patch_sidecar,
                       pid_alive, process_start, run_slots, sessions_dir, tail_text,
                       write_private)
 
@@ -25,6 +25,7 @@ DEFAULT_TIMEOUT_MS = 20 * 60 * 1000
 TIMEOUT_EXIT = 124
 PREVIEW_CHARS = 2_000
 INLINE_PROMPT_MAX_BYTES = 100_000
+HEARTBEAT_SECONDS = 120  # progress line interval while Pi runs
 
 # ---------------------------------------------------------------------------
 # Pi skills / extensions resource resolution (Pi 1.4+ CLI flags)
@@ -315,9 +316,35 @@ def _on_signal(signum: int, _frame: Any) -> None:
     raise SystemExit(128 + signum)
 
 
-def run_pi(cwd: Path, argv: List[str], deadline: Optional[float] = None) -> Tuple[int, str]:
+def progress_line(home: Path, sid: str, ref: str, started: float,
+                  deadline: Optional[float]) -> str:
+    """One `pier: <ref> running …` line from the session file so far: tool calls
+    and tool names only, never their arguments (those can hold secrets)."""
+    parts = [f"pier: {ref} running {fmt_age(int(time.monotonic() - started))}"]
+    try:
+        sfile = find_session_file(home, sid)
+        turn = last_turn(sfile) if sfile else None
+    except Exception as exc:
+        # Reported, never raised: an escape from the wait loop would abort the run
+        # and leave Pi running. The final last_turn still fails loudly.
+        return f"pier: cannot read {ref} progress: {exc!r}"
+    if turn is not None:
+        if turn.tool_calls:
+            last = f", last {turn.last_tool}" if turn.last_tool else ""
+            parts.append(f"{turn.tool_calls} tools{last}")
+        total = (turn.usage or {}).get("totalTokens")
+        if isinstance(total, (int, float)):
+            parts.append(f"{fmt_tokens(int(total))} tok")
+    if deadline is not None:
+        parts.append(f"{fmt_age(max(0, int(deadline - time.monotonic())))} left")
+    return " · ".join(parts)
+
+
+def run_pi(cwd: Path, argv: List[str], deadline: Optional[float] = None,
+           heartbeat: Optional[Callable[[], str]] = None) -> Tuple[int, str]:
     """Run Pi; after `deadline` (a time.monotonic() instant) kill its whole tree
-    and raise RunTimedOut."""
+    and raise RunTimedOut. `heartbeat` is called every HEARTBEAT_SECONDS and its
+    line printed on stderr while Pi runs."""
     if _stopping.is_set():
         raise PierError("pier is stopping")
     try:
@@ -330,9 +357,8 @@ def run_pi(cwd: Path, argv: List[str], deadline: Optional[float] = None) -> Tupl
         if _stopping.is_set():
             proc.terminate()
     try:
-        timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
         try:
-            _, err = proc.communicate(timeout=timeout)
+            err = _wait_for_pi(proc, deadline, heartbeat, HEARTBEAT_SECONDS)
         except subprocess.TimeoutExpired:
             terminate_tree(proc)
             try:
@@ -345,6 +371,27 @@ def run_pi(cwd: Path, argv: List[str], deadline: Optional[float] = None) -> Tupl
         with _children_lock:
             _children.remove(proc)
     return proc.returncode, err.decode("utf-8", errors="replace")
+
+
+def _wait_for_pi(proc: subprocess.Popen, deadline: Optional[float],
+                 heartbeat: Optional[Callable[[], str]], interval: float) -> bytes:
+    """communicate() up to the deadline in `interval` slices, so a heartbeat can
+    print meanwhile; retrying communicate() loses no output (subprocess docs).
+    Raises TimeoutExpired once the deadline passed."""
+    while True:
+        if deadline is None:
+            timeout = None if heartbeat is None else interval
+        else:
+            remaining = max(0.0, deadline - time.monotonic())
+            timeout = remaining if heartbeat is None else min(interval, remaining)
+        try:
+            return proc.communicate(timeout=timeout)[1]
+        except subprocess.TimeoutExpired:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise
+            line = heartbeat() if heartbeat else None
+            if line:
+                print(line, file=sys.stderr, flush=True)
 
 
 @dataclass
@@ -394,7 +441,10 @@ def run_turn(home: Path, binary: str, sid: str, cwd: Path, flags: List[str],
         patch_sidecar(home, sid, pid=os.getpid(), pid_start=process_start(os.getpid()))
         try:
             with run_slots(home, ref, deadline):
-                code, err = run_pi(cwd, argv, deadline)
+                started = time.monotonic()
+                code, err = run_pi(cwd, argv, deadline,
+                                   heartbeat=lambda: progress_line(home, sid, ref, started,
+                                                                  deadline))
         finally:
             patch_sidecar(home, sid, pid=None, pid_start=None)
     sfile = find_session_file(home, sid)
